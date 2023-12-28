@@ -1,0 +1,9 @@
+conda create -n retexo_py3.8 python=3.8
+conda activate retexo_py3.8
+pip install torch==1.12.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
+pip install torch_geometric torch_sparse==0.6.16 torch_scatter==2.1.0 -f https://data.pyg.org/whl/torch-1.12.1%2Bcu113.html
+pip install dgl==1.1.0 -f https://data.dgl.ai/wheels/cu113/repo.html
+pip install ogb
+pip install hydra-core --upgrade
+pip install torchmetrics
+
