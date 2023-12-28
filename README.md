@@ -116,6 +116,8 @@ Aashish Kolluri: aashish7@comp.nus.edu.sg, aashishkolluri6@gmail.com
 
 Sarthak Choudhary: csarthak76@gmail.com
 
+Bryan Hooi: dcsbhk@nus.edu.sg
+
 Prateek Saxena: prateeks@comp.nus.edu.sg
 
 
