@@ -7,7 +7,7 @@ Graph data can be large and is often stored distributed across many machines (cl
 **Paper:** New version to be public, Previous version is on [arXiv](https://arxiv.org/abs/2302.13053).
 
 **Authors:** Aashish Kolluri* and Sarthak Choudhary* and Bryan Hooi and Prateek Saxena\
-(* Equal contribution. Sarthak mainly helped with evaluation of Retexo against the baselines and aggregating the results.)
+(* Equal contribution.)
 
 ## Environment Setup
 Retexo is built and tested using the following libraries.
