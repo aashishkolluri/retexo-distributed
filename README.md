@@ -28,11 +28,7 @@ conda create -n retexo_py3.8 python=3.8
 conda activate retexo_py3.8
 ```
 
-The dependencies can be installed within the conda environment using the commands given in ```commands_cu11.3.txt``` file or using the following command.
-
-```
-pip install -r requirements.txt
-```
+The dependencies can be installed within the conda environment using the commands given in ```commands_cu11.3.txt``` file.
 
 ## Running Retexo on a Single Node (Machine)
 
