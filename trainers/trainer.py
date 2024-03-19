@@ -545,6 +545,7 @@ def init_process(rank, cfg, hydra_output_dir):
     )
 
     results_dir = f"results/{cfg.dataset.partition.dataset_name}_{cfg.model.conv_layer._target_}_{cfg.dataset.partition.num_parts}/rank_{rank}/"
+    
     start_time = time.time()
     train(
         sub_graph,

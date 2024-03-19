@@ -5,6 +5,8 @@ import os
 import json
 import numpy as np
 from typing import Dict, List, Optional, Tuple
+from data.rel_dataset import DistrRelBenchDataset
+from relbench.data import NodeTask
 import dgl # type: ignore
 from dgl.data import RedditDataset, YelpDataset, CoraGraphDataset, KarateClubDataset # type: ignore
 from dgl.distributed import partition_graph, GraphPartitionBook # type: ignore
@@ -13,6 +15,11 @@ import torch
 from torch_geometric.datasets import FacebookPagePage, Planetoid, LastFMAsia # type: ignore
 from torch_geometric.utils.convert import to_dgl # type: ignore
 from sklearn.preprocessing import StandardScaler # type: ignore
+from torch_geometric.data import HeteroData
+from relbench.data.database import Database
+
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +297,15 @@ def graph_partition(
             f_ptr,
         )
 
+def load_rel_partition(
+    partition_dir: str, dataset_name: str, task_name: str, part_id: int
+) -> Tuple[DistrRelBenchDataset, NodeTask]:
+    
+    # partition_graph_dir = os.path.join(partition_dir, dataset_name)
+    dataset = DistrRelBenchDataset(partition_dir=partition_dir, part_id=part_id, distributed=True)
+    task = dataset.get_task(task_name, process=True)
+  
+    return dataset, task
 
 def load_partition(
     partition_dir: str, dataset_name: str, part_id: int
