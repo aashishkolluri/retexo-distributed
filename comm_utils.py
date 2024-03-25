@@ -5,9 +5,14 @@ from multiprocessing.pool import ThreadPool
 import time
 import dgl # type: ignore
 from dgl.distributed import GraphPartitionBook # type: ignore
+from torch_geometric.distributed.local_feature_store import LocalFeatureStore
+from torch_geometric.distributed.local_graph_store import LocalGraphStore
+from torch_geometric.data import HeteroData
+
 import torch.distributed as dist
 import torch
 import torch.nn as nn
+
 
 
 def send_and_receive_embeddings(
@@ -58,7 +63,13 @@ def send_and_receive_embeddings(
 
 
 def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
-    """Get the boundary nodes"""
+    """
+    Get the boundary nodes
+    
+    Here each worker sends the number of boundary nodes followed by the boundary
+    node to every other worker. 
+    Similarly, it receives those information from every other worker.
+    """
 
     rank, size = dist.get_rank(), dist.get_world_size()
     device = "cuda"
@@ -68,6 +79,64 @@ def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
         left = (rank - i + size) % size
         right = (rank + i) % size
         belong_right = node_info_dict["part_id"] == right
+        num_right = belong_right.sum().view(-1)
+        if dist.get_backend() == "gloo":
+            num_right = num_right.cpu()
+            num_left = torch.tensor([0])
+        else:
+            num_left = torch.tensor([0], device=device)
+        req = dist.isend(num_right, dst=right)
+        dist.recv(num_left, src=left)
+        start = gpb.partid2nids(right)[0].item()
+        v = node_info_dict[dgl.NID][belong_right] - start
+        if dist.get_backend() == "gloo":
+            v = v.cpu()
+            u = torch.zeros(num_left, dtype=torch.long) # type: ignore
+
+        req.wait()
+        req = dist.isend(v, dst=right)
+        dist.recv(u, src=left)
+        # u, _ = torch.sort(u)
+
+        if dist.get_backend() == "gloo":
+            boundary[left] = u
+        req.wait()
+
+    return boundary
+
+
+def get_boundary_nodes_pyg(graph_store: LocalGraphStore, feats: LocalFeatureStore):
+    """Get the boundary nodes"""
+
+    rank, size = dist.get_rank(), dist.get_world_size()
+    device = "cuda"
+    boundary = [None] * size
+
+
+    for i in range(1, size):
+        left = (rank - i + size) % size
+        right = (rank + i) % size
+        
+        feats.get_tensor_from_global_id
+        for j in range(len(feats.meta["node_types"])):
+            node_type = feats.meta["node_types"][j]
+            belong_right = feats.node_feat_pb[node_type] == right
+            num_right = belong_right.sum().view(-1)
+            if dist.get_backend() == "gloo":
+                num_right = num_right.cpu()
+                num_left = torch.tensor([0])
+            else:
+                num_left = torch.tensor([0], device=device)
+            req = dist.isend(num_right, dst=right)
+            dist.recv(num_left, src=left)
+            feats.partition_idx
+            node_offset = feats.meta["node_offset"][j]
+            # v = feats.[node_type][belong_right]
+            if dist.get_backend() == "gloo":
+                v = v.cpu()
+                u = torch.zeros(num_left, dtype=torch.long)
+
+        belong_right = graph.node_pb == right
         num_right = belong_right.sum().view(-1)
         if dist.get_backend() == "gloo":
             num_right = num_right.cpu()

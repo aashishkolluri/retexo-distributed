@@ -1,6 +1,7 @@
 import os
 import time
 
+import torch
 import torch.distributed as dist
 from relbench.data import RelBenchDataset
 from data.dataset import load_rel_partition
@@ -11,21 +12,49 @@ from torch_geometric.data import HeteroData
 from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
 from relbench.data import NodeTask
 from torch_frame.config.text_embedder import TextEmbedderConfig
+from torch_geometric.distributed.local_feature_store import LocalFeatureStore
+from torch_geometric.distributed.local_graph_store import LocalGraphStore
 
 from text_embedder import GloveTextEmbedding
 from inferred_stypes import dataset2inferred_stypes
 from omegaconf import DictConfig
+from comm_utils import get_boundary_nodes_pyg
+
 
 def train(
     graph: HeteroData,
+    feat_store: LocalFeatureStore,
+    graph_store: LocalGraphStore,
     table_input: NodeTrainTableInput,
     task: NodeTask,
     cfg: DictConfig,
     hydra_output_dir: str,
     results_dir: str,
 ) -> None:
-    r"""Implement end-to-end training process"""
+    """Implement end-to-end training process
     
+    Parameters
+    ----------
+    TODO
+    
+    
+    
+    Returns
+    -------
+    None
+    """
+    
+    get_boundary_nodes_pyg(graph_store, feat_store)
+
+    
+    # TODO
+    # - get boundary nodes
+    # - send and receive embeddings
+    # - start training by layer
+    # - msg passing in-between layers
+    # - model update
+    # - evaluate model
+    # - save model
     
     raise NotImplementedError
 
@@ -47,21 +76,22 @@ def init_process(rank, cfg, hydra_output_dir):
 
     # TODO
     # 1. Load the partition directly (using rank)
-    dataset, task = load_rel_partition(partition_dir=cfg.partition_dir, dataset_name=cfg.dataset_name, task_name=cfg.task.name, partition_id=rank)
     
+    dataset, task, feat_store, graph_store = load_rel_partition(partition_dir=cfg.partition_dir, dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=rank)
     col_to_stype_dict = dataset2inferred_stypes[cfg.dataset_name]
-    graph, col_stats_dict = make_pkey_fkey_graph(
-        dataset.db,
-        col_to_stype_dict=col_to_stype_dict,
-        text_embedder_cfg=TextEmbedderConfig(
-            text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
-        ),
-        cache_dir=os.path.join(cfg.partition_dir, f"{cfg.dataset_name}_materialized_cache"),
-    )
+    # graph, col_stats_dict = make_pkey_fkey_graph(
+    #     dataset.db,
+    #     col_to_stype_dict=col_to_stype_dict,
+    #     text_embedder_cfg=TextEmbedderConfig(
+    #         text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
+    #     ),
+    #     cache_dir=os.path.join(cfg.partition_dir, f"{cfg.dataset_name}_materialized_cache"),
+    # )
 
-    table_input = get_node_train_table_input(table=task.train_table, task=task)
-   
-   
+    # table_input = get_node_train_table_input(table=task.train_table, task=task)
+    # graph = None
+    table_input = None
+    
     os.makedirs("results/", exist_ok=True)
     os.makedirs(
         f"results/{cfg.dataset.partition.dataset_name}_{cfg.model.conv_layer._target_}_{cfg.dataset.partition.num_parts}/",
@@ -77,7 +107,9 @@ def init_process(rank, cfg, hydra_output_dir):
     start_time = time.time()
     
     train(
-        graph,
+        None,
+        feat_store,
+        graph_store,
         table_input,
         task,
         cfg,

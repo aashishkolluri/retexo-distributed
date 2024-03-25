@@ -1,9 +1,7 @@
 import os
 import hashlib
 
-from relbench.datasets import get_dataset
-from relbench.datasets.stackex import StackExDataset
-from relbench.data import Database, Dataset, Table
+from relbench.data import Database, Dataset, Table, BaseTask
 import pandas as pd
 import numpy as np
 import shutil
@@ -18,7 +16,7 @@ class DistrRelBenchDataset(Dataset):
     train_start_timestamp: Optional[pd.Timestamp] = None
     val_timestamp: pd.Timestamp
     test_timestamp: pd.Timestamp
-    # task_cls_list: List[Type[BaseTask]]
+    task_cls_list: List[Type[BaseTask]]
 
     db_dir: str = "db"
     
@@ -30,7 +28,7 @@ class DistrRelBenchDataset(Dataset):
         distributed: bool = False,
     ):
         if distributed:
-            db_path = os.path.join(partition_dir, self.name, f"shard_{part_id}")
+            db_path = os.path.join(partition_dir, f"part_{part_id}/db")
             print(f"loading Database object from {db_path}...")
             tic = time.time()
             db = Database.load(db_path)
@@ -55,7 +53,7 @@ class DistrRelBenchDataset(Dataset):
             self.val_timestamp,
             self.test_timestamp,
             self.max_eval_time_frames,
-            self.task_cls_list,
+            [],
         )
     
     def make_db(self) -> Database:

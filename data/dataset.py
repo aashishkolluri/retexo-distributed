@@ -6,7 +6,9 @@ import json
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from data.rel_dataset import DistrRelBenchDataset
-from relbench.data import NodeTask
+from data.rel_stackex import DistrStackExDataset
+from relbench.data import NodeTask, RelBenchDataset
+from relbench.datasets import StackExDataset
 import dgl # type: ignore
 from dgl.data import RedditDataset, YelpDataset, CoraGraphDataset, KarateClubDataset # type: ignore
 from dgl.distributed import partition_graph, GraphPartitionBook # type: ignore
@@ -17,6 +19,17 @@ from torch_geometric.utils.convert import to_dgl # type: ignore
 from sklearn.preprocessing import StandardScaler # type: ignore
 from torch_geometric.data import HeteroData
 from relbench.data.database import Database
+from relbench.data.table import Table
+from torch_geometric.distributed.partition import Partitioner
+from torch_geometric.distributed.local_feature_store import LocalFeatureStore
+from torch_geometric.distributed.local_graph_store import LocalGraphStore
+
+
+from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
+from text_embedder import GloveTextEmbedding 
+from inferred_stypes import dataset2inferred_stypes
+from omegaconf import DictConfig
+from torch_frame.config.text_embedder import TextEmbedderConfig
 
 
 
@@ -296,16 +309,97 @@ def graph_partition(
             },
             f_ptr,
         )
+        
+        
+def rel_graph_partition(
+    dataset_name: RelBenchDataset,
+    partition_dir: str,
+    num_parts: int,
+    cfg: DictConfig,
+) -> None:
+    
+    if dataset_name == "rel-stackex":
+        dataset = StackExDataset(process = True)
+    else:
+        raise NameError("no implementation for given dataset")
+    
+    # create graph of whole database:
+    col_to_stype_dict = dataset2inferred_stypes[cfg.dataset_name]
+    graph, col_stats_dict = make_pkey_fkey_graph(
+        dataset.db,
+        col_to_stype_dict=col_to_stype_dict,
+        text_embedder_cfg=TextEmbedderConfig(
+            text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
+        ),
+        cache_dir=os.path.join(cfg.partition_dir, f"{cfg.dataset_name}_materialized_cache"),
+    )
+    
+    # partition the graph
+    partition_graph_dir = os.path.join(partition_dir, dataset.name)
+    partition_config = os.path.join(partition_graph_dir, f"{dataset.name}.json")
+    
+    partitioner = Partitioner(graph, num_parts, partition_graph_dir)
+    # partitioner.generate_partition()
+    
+    
+    for i in range(num_parts):
+        tables = {}
+        distr_db =  dataset.db#StackExDataset(process = True).db #TODO see if we change the db (then take fresh one)
+        
+        node_feats = torch.load(f"{partition_graph_dir}/part_{i}/node_feats.pt")
+        graph = torch.load(f"{partition_graph_dir}/part_{i}/graph.pt")
+        edge_feats = torch.load(f"{partition_graph_dir}/part_{i}/edge_feats.pt")
+    
+        
+        for table_name, table in distr_db.table_dict.items():
+            # Materialize the tables into tensor frames:
+            df = table.df
+            
+            # node_map =  torch.load(f"{partition_graph_dir}/node_map/{table_name}.pt")
+            # edge_map =  torch.load(f"{partition_graph_dir}/edge_map/{table_name}.pt")   
+                        
+            # only keep rows of df that have id in node_feats
+            df = df[df[table.pkey_col].isin(node_feats[table_name]["id"].tolist())]
+            
+            filtered_table = Table(df=df, pkey_col=table.pkey_col, fkey_col_to_pkey_table=table.fkey_col_to_pkey_table, time_col=table.time_col)
+            filtered_table.df.sort_index(inplace=True)
+            tables[table_name] = filtered_table
+
+        db = Database(tables)
+        
+        db.save(f"{partition_graph_dir}/part_{i}/db")
+        
+    # debug code to check sizes
+    for table_name, table in distr_db.table_dict.items():
+        sum = 0
+        for i in range(num_parts):
+            node_feats = torch.load(f"{partition_graph_dir}/part_{i}/node_feats.pt")
+            sum += len(node_feats[table_name]["id"].tolist())
+        print("total for table " + table_name + " is " + str(sum) + " / " + str(len(table.df)))
+    return
+        
 
 def load_rel_partition(
     partition_dir: str, dataset_name: str, task_name: str, part_id: int
 ) -> Tuple[DistrRelBenchDataset, NodeTask]:
     
     # partition_graph_dir = os.path.join(partition_dir, dataset_name)
-    dataset = DistrRelBenchDataset(partition_dir=partition_dir, part_id=part_id, distributed=True)
-    task = dataset.get_task(task_name, process=True)
-  
-    return dataset, task
+    # if dataset_name == "rel-stackex":
+    #     dataset = DistrStackExDataset(partition_dir=f"{partition_dir}", part_id=part_id, distributed=True)
+    # else:
+    #     raise NameError("no implementation for given dataset")
+    # task = dataset.get_task(task_name, process=True)
+    
+    feat_store = LocalFeatureStore.from_partition(partition_dir, part_id)
+    node_feats = torch.load(f"{partition_dir}/part_{part_id}/node_feats.pt")
+    graph_store = LocalGraphStore.from_partition(partition_dir, part_id)
+    
+    # node = 
+
+    # load graph, node_feats, edge_feats
+    # META information and node / edge maps available
+    
+    return None, None, feat_store, graph_store
 
 def load_partition(
     partition_dir: str, dataset_name: str, part_id: int
@@ -389,3 +483,4 @@ def load_partition(
         n_test,
         graph_partition_book,
     )
+

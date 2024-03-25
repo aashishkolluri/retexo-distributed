@@ -1,9 +1,9 @@
 # default configuration
 
-app: "train" # train, partition_data
-dataset_name: "reddit"
+app: "train" # train, partition_data, partition_relational_data
+dataset_name: "rel-stackex"
 dataset_dir: ../retexo-datasets/
-partition_dir: ../retexo-datasets/partitions/
+partition_dir: ./data/rel-stackex
 partition_method: "random"
 part_obj: "vol"
 num_partitions: 4
@@ -63,4 +63,5 @@ distributed:
   master_port: "10011"
 
 task:
+  name: "rel-stackex-votes"
   _target_: tasks.node_classification.NodeClassificationTask

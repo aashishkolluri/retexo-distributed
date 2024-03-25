@@ -8,16 +8,22 @@ import torch
 import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
+from data.dataset import load_data, graph_partition, rel_graph_partition, load_rel_partition
 import trainers.trainer
-from data.dataset import load_data, graph_partition
+import trainers.rel_trainer
 
 # logging.basicConfig(level = logging.INFO)
 
-@hydra.main(config_path="conf", config_name="node_classification", version_base=None)
+@hydra.main(config_path="conf", config_name="node_regression_relbench", version_base=None)
 def main(cfg: DictConfig) -> None:
     """Run the specified application"""
 
     print(OmegaConf.to_yaml(cfg))
+
+    # load_rel_partition(cfg.partition_dir, cfg.dataset_name, cfg.task.name, 0) 
+    rel_graph_partition(
+        cfg.dataset_name, "data", cfg.num_partitions, cfg
+        )  
 
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
@@ -26,8 +32,13 @@ def main(cfg: DictConfig) -> None:
         graph, _, _ = load_data(**cfg.dataset.download)
         graph_partition(graph, **cfg.dataset.partition)
         return
+    elif cfg.app == "partition_relational_data":
+        rel_graph_partition(
+            cfg.dataset_name, "data", cfg.num_partitions, cfg
+         )   
+        return
     elif cfg.app == "train":
-        train = trainers.trainer
+        train = trainers.rel_trainer
         # set up the distributed training environment
         if cfg.distributed.backend == "gloo":
             n_devices = torch.cuda.device_count()
