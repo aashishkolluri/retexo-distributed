@@ -319,87 +319,92 @@ def rel_graph_partition(
 ) -> None:
     
     if dataset_name == "rel-stackex":
-        dataset = StackExDataset(process = True)
+        dataset = DistrStackExDataset(partition_dir=partition_dir)
     else:
         raise NameError("no implementation for given dataset")
     
-    # create graph of whole database:
-    col_to_stype_dict = dataset2inferred_stypes[cfg.dataset_name]
-    graph, col_stats_dict = make_pkey_fkey_graph(
-        dataset.db,
-        col_to_stype_dict=col_to_stype_dict,
-        text_embedder_cfg=TextEmbedderConfig(
-            text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
-        ),
-        cache_dir=os.path.join(cfg.partition_dir, f"{cfg.dataset_name}_materialized_cache"),
-    )
+    dataset.shardDataset(num_shards=num_parts, folder=partition_dir)
     
-    # partition the graph
-    partition_graph_dir = os.path.join(partition_dir, dataset.name)
-    partition_config = os.path.join(partition_graph_dir, f"{dataset.name}.json")
+    # # create graph of whole database:
+    # col_to_stype_dict = dataset2inferred_stypes[cfg.dataset_name]
+    # graph, col_stats_dict = make_pkey_fkey_graph(
+    #     dataset.db,
+    #     col_to_stype_dict=col_to_stype_dict,
+    #     text_embedder_cfg=TextEmbedderConfig(
+    #         text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
+    #     ),
+    #     cache_dir=os.path.join(cfg.partition_dir, f"{cfg.dataset_name}_materialized_cache"),
+    # )
     
-    partitioner = Partitioner(graph, num_parts, partition_graph_dir)
-    # partitioner.generate_partition()
+    # # partition the graph
+    # partition_graph_dir = os.path.join(partition_dir, dataset.name)
+    # partition_config = os.path.join(partition_graph_dir, f"{dataset.name}.json")
+    
+    # partitioner = Partitioner(graph, num_parts, partition_graph_dir)
+    # # partitioner.generate_partition()
     
     
-    for i in range(num_parts):
-        tables = {}
-        distr_db =  dataset.db#StackExDataset(process = True).db #TODO see if we change the db (then take fresh one)
+    # for i in range(num_parts):
+    #     tables = {}
+    #     distr_db =  dataset.db#StackExDataset(process = True).db #TODO see if we change the db (then take fresh one)
         
-        node_feats = torch.load(f"{partition_graph_dir}/part_{i}/node_feats.pt")
-        graph = torch.load(f"{partition_graph_dir}/part_{i}/graph.pt")
-        edge_feats = torch.load(f"{partition_graph_dir}/part_{i}/edge_feats.pt")
+    #     node_feats = torch.load(f"{partition_graph_dir}/part_{i}/node_feats.pt")
+    #     graph = torch.load(f"{partition_graph_dir}/part_{i}/graph.pt")
+    #     edge_feats = torch.load(f"{partition_graph_dir}/part_{i}/edge_feats.pt")
     
         
-        for table_name, table in distr_db.table_dict.items():
-            # Materialize the tables into tensor frames:
-            df = table.df
+    #     for table_name, table in distr_db.table_dict.items():
+    #         # Materialize the tables into tensor frames:
+    #         df = table.df
             
-            # node_map =  torch.load(f"{partition_graph_dir}/node_map/{table_name}.pt")
-            # edge_map =  torch.load(f"{partition_graph_dir}/edge_map/{table_name}.pt")   
+    #         # node_map =  torch.load(f"{partition_graph_dir}/node_map/{table_name}.pt")
+    #         # edge_map =  torch.load(f"{partition_graph_dir}/edge_map/{table_name}.pt")   
                         
-            # only keep rows of df that have id in node_feats
-            df = df[df[table.pkey_col].isin(node_feats[table_name]["id"].tolist())]
+    #         # only keep rows of df that have id in node_feats
+    #         df = df[df[table.pkey_col].isin(node_feats[table_name]["id"].tolist())]
             
-            filtered_table = Table(df=df, pkey_col=table.pkey_col, fkey_col_to_pkey_table=table.fkey_col_to_pkey_table, time_col=table.time_col)
-            filtered_table.df.sort_index(inplace=True)
-            tables[table_name] = filtered_table
+    #         filtered_table = Table(df=df, pkey_col=table.pkey_col, fkey_col_to_pkey_table=table.fkey_col_to_pkey_table, time_col=table.time_col)
+    #         filtered_table.df.sort_index(inplace=True)
+    #         tables[table_name] = filtered_table
 
-        db = Database(tables)
+    #     db = Database(tables)
         
-        db.save(f"{partition_graph_dir}/part_{i}/db")
+    #     db.save(f"{partition_graph_dir}/part_{i}/db")
         
-    # debug code to check sizes
-    for table_name, table in distr_db.table_dict.items():
-        sum = 0
-        for i in range(num_parts):
-            node_feats = torch.load(f"{partition_graph_dir}/part_{i}/node_feats.pt")
-            sum += len(node_feats[table_name]["id"].tolist())
-        print("total for table " + table_name + " is " + str(sum) + " / " + str(len(table.df)))
+    # # debug code to check sizes
+    # for table_name, table in distr_db.table_dict.items():
+    #     sum = 0
+    #     for i in range(num_parts):
+    #         node_feats = torch.load(f"{partition_graph_dir}/part_{i}/node_feats.pt")
+    #         sum += len(node_feats[table_name]["id"].tolist())
+    #     print("total for table " + table_name + " is " + str(sum) + " / " + str(len(table.df)))
     return
         
 
 def load_rel_partition(
     partition_dir: str, dataset_name: str, task_name: str, part_id: int
-) -> Tuple[DistrRelBenchDataset, NodeTask]:
+) -> Tuple[DistrRelBenchDataset, NodeTask, Dict]:
     
     # partition_graph_dir = os.path.join(partition_dir, dataset_name)
-    # if dataset_name == "rel-stackex":
-    #     dataset = DistrStackExDataset(partition_dir=f"{partition_dir}", part_id=part_id, distributed=True)
-    # else:
-    #     raise NameError("no implementation for given dataset")
-    # task = dataset.get_task(task_name, process=True)
+    if dataset_name == "rel-stackex":
+        dataset = DistrStackExDataset(partition_dir=f"{partition_dir}", part_id=part_id, distributed=True)
+    else:
+        raise NameError("no implementation for given dataset")
+    task = dataset.get_task(task_name, process=True)
     
-    feat_store = LocalFeatureStore.from_partition(partition_dir, part_id)
-    node_feats = torch.load(f"{partition_dir}/part_{part_id}/node_feats.pt")
-    graph_store = LocalGraphStore.from_partition(partition_dir, part_id)
+    node_dict = torch.load(f"{partition_dir}/node_dict.pt")  
+    local_dict = torch.load(f"{partition_dir}/shard_{part_id}/local_to_global_id_dict.pt") 
+    
+    # feat_store = LocalFeatureStore.from_partition(partition_dir, part_id)
+    # node_feats = torch.load(f"{partition_dir}/part_{part_id}/node_feats.pt")
+    # graph_store = LocalGraphStore.from_partition(partition_dir, part_id)
     
     # node = 
 
     # load graph, node_feats, edge_feats
     # META information and node / edge maps available
     
-    return None, None, feat_store, graph_store
+    return dataset, task, node_dict, local_dict
 
 def load_partition(
     partition_dir: str, dataset_name: str, part_id: int

@@ -1,14 +1,19 @@
 import os
+import torch
 
 from relbench.datasets import get_dataset
 from relbench.datasets.stackex import StackExDataset
-from relbench.data import Database, RelBenchDataset, Table
+from relbench.data import Database, RelBenchDataset, Table, Dataset
+from relbench.utils import unzip_processor
 import pandas as pd
 import numpy as np
+import pooch
+
 
 from pathlib import Path
 from typing import List, Optional, Tuple, Type, Union
 from data.rel_dataset import DistrRelBenchDataset
+from relbench.tasks.stackex import VotesTask
 
 
 class DistrStackExDataset(DistrRelBenchDataset):
@@ -17,6 +22,15 @@ class DistrStackExDataset(DistrRelBenchDataset):
     val_timestamp = pd.Timestamp("2019-01-01")
     test_timestamp = pd.Timestamp("2021-01-01")
     max_eval_time_frames = 1
+    
+    task_cls_list = [
+        # EngageTask,
+        VotesTask,
+        # BadgesTask,
+        # UserCommentOnPostTask,
+        # RelatedPostTask,
+        # UsersInteractTask,
+    ]
 
     def __init__(
         self,
@@ -181,7 +195,10 @@ class DistrStackExDataset(DistrRelBenchDataset):
         vote_shards = []
         remaining_votes = votes.df
         
-        remaining_posts = self.retrieve_foreign_rows(shards[0]["df"], vote_shards, remaining_votes, votes.df, foreignKey="UserId")
+        remaining_votes = self.retrieve_foreign_rows(shards[0]["df"], vote_shards, remaining_votes, votes.df, foreignKey="UserId")
+        
+        votes.df = self.update_part_id(votes.df, vote_shards)
+            
         # Filling the shards with the remaining votes 
         vote_shards = self.fill_shards(num_shards, votes, vote_shards, remaining_votes)            
         shards.append(
@@ -190,7 +207,7 @@ class DistrStackExDataset(DistrRelBenchDataset):
                     "fk_to_table": votes.fkey_col_to_pkey_table,
                     "time_col": votes.time_col
                 }
-                )   
+                )           
         
         # Posts table
         posts = db.table_dict["posts"]
@@ -198,7 +215,11 @@ class DistrStackExDataset(DistrRelBenchDataset):
         remaining_posts = posts.df
             
         remaining_posts = self.retrieve_foreign_rows(shards[0]["df"], post_shards, remaining_posts, posts.df, foreignKey="OwnerUserId")
-        remaining_posts = self.retrieve_foreign_rows(shards[1]["df"], post_shards, remaining_posts, posts.df, OnKey="PostId", foreignKey="Id")
+
+        posts.df = self.update_part_id(posts.df, post_shards)
+
+
+        remaining_posts = self.retrieve_foreign_rows(shards[1]["df"], post_shards, remaining_posts, posts.df, OnKey="PostId", foreignKey="Id")   
             
         post_shards = self.fill_shards(num_shards, posts, post_shards, remaining_posts)            
         shards.append(
@@ -216,6 +237,7 @@ class DistrStackExDataset(DistrRelBenchDataset):
         remaining_badges = badges.df
             
         remaining_badges = self.retrieve_foreign_rows(shards[0]["df"], badge_shards, remaining_badges, badges.df, foreignKey="UserId")
+        badges.df = self.update_part_id(badges.df, badge_shards)
 
         badge_shards = self.fill_shards(num_shards, badges, badge_shards, remaining_badges)            
         shards.append(
@@ -232,7 +254,9 @@ class DistrStackExDataset(DistrRelBenchDataset):
         remaining_comments = comments.df
         
         remaining_comments = self.retrieve_foreign_rows(shards[0]["df"], comment_shards, remaining_comments, comments.df, foreignKey="UserId")
+        comments.df = self.update_part_id(comments.df, comment_shards)
         remaining_comments = self.retrieve_foreign_rows(shards[2]["df"], comment_shards, remaining_comments, comments.df, foreignKey="PostId")
+        comments.df = self.update_part_id(comments.df, comment_shards)
         
         comment_shards = self.fill_shards(num_shards, comments, comment_shards, remaining_comments)
         shards.append(
@@ -249,7 +273,9 @@ class DistrStackExDataset(DistrRelBenchDataset):
         remaining_postHistory = postHistory.df
         
         remaining_postHistory = self.retrieve_foreign_rows(shards[0]["df"], postHistory_shards, remaining_postHistory, postHistory.df, foreignKey="UserId")
+        postHistory.df = self.update_part_id(postHistory.df, postHistory_shards)
         remaining_postHistory = self.retrieve_foreign_rows(shards[2]["df"], postHistory_shards, remaining_postHistory, postHistory.df, foreignKey="PostId")
+        postHistory.df = self.update_part_id(postHistory.df, postHistory_shards)
         
         postHistory_shards = self.fill_shards(num_shards, postHistory, postHistory_shards, remaining_postHistory)
         shards.append(
@@ -266,7 +292,9 @@ class DistrStackExDataset(DistrRelBenchDataset):
         remaining_postLinks = postLinks.df
         
         remaining_postLinks = self.retrieve_foreign_rows(shards[2]["df"], postLinks_shards, remaining_postLinks, postLinks.df, foreignKey="PostId")
+        postLinks.df = self.update_part_id(postLinks.df, postLinks_shards)
         remaining_postLinks = self.retrieve_foreign_rows(shards[2]["df"], postLinks_shards, remaining_postLinks, postLinks.df, foreignKey="RelatedPostId")
+        postLinks.df = self.update_part_id(postLinks.df, postLinks_shards)
         
         postLinks_shards = self.fill_shards(num_shards, postLinks, postLinks_shards, remaining_postLinks)
         shards.append(
@@ -286,7 +314,37 @@ class DistrStackExDataset(DistrRelBenchDataset):
                 
             duplicated = sum - total
             print("Portion of data duplicated "+ str((duplicated/total*100)) + "%")
+            
         
+        # sanity checks
+        for shard in shards:
+            df = pd.DataFrame()
+            for i in range(num_shards): 
+                df = pd.concat([df, shard["df"][i]])
+                assert shard["df"][i].nunique()["Id"] == shard["df"][i].shape[0]
+
+            uniques = df.drop_duplicates(subset=['Id', 'part_id'], keep='first')
+            count_partitions_per_id = uniques.groupby('Id')['part_id'].nunique()
+
+            # Check if sample has more than one unique value in "part_id"
+            assert not (count_partitions_per_id > 1).any()
+        
+            
+        # store node dictionary
+        node_dict = {}
+        for shard in shards:
+            df = pd.DataFrame()
+            for i in range(num_shards): 
+                df = pd.concat([df, shard["df"][i]])
+                assert shard["df"][i].nunique()["Id"] == shard["df"][i].shape[0]
+                shard["df"][i]["GlobalId"] = shard["df"][i]["Id"].copy()
+                
+            uniques = df.drop_duplicates(subset='Id', keep='first')
+            sorted = uniques.sort_values(by='Id')
+            node_dict[shard["name"]] = sorted[['Id', 'part_id']]
+            
+        # save node dictionary
+        torch.save(node_dict, f"{folder}/{self.name}/node_dict.pt")     
         
         # Make a database for each shard
         databases = []
@@ -301,6 +359,19 @@ class DistrStackExDataset(DistrRelBenchDataset):
                 )
                 
             db = Database(tables)    
+            db.reindex_pkeys_and_fkeys()
+            self.validate_db(db)
+            
+            # store global_id column
+            local_to_global_id_dict = {}
+            for table in db.table_dict:
+                df = db.table_dict[table].df[["GlobalId", "part_id"]]
+                local_to_global_id_dict[table] = df
+            
+             
+            torch.save(local_to_global_id_dict, f"{folder}/{self.name}/shard_{i}/local_to_global_id_dict.pt")     
+            # test = torch.load(f"{folder}/{self.name}/shard_{i}/local_to_global_id_dict.pt")
+            
             # save db to specific folder
             db.save(f"{folder}/{self.name}/shard_{i}")
             databases.append(db)

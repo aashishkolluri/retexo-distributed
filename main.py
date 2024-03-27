@@ -21,9 +21,9 @@ def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     # load_rel_partition(cfg.partition_dir, cfg.dataset_name, cfg.task.name, 0) 
-    rel_graph_partition(
-        cfg.dataset_name, "data", cfg.num_partitions, cfg
-        )  
+    # rel_graph_partition(
+    #     cfg.dataset_name, "data", cfg.num_partitions, cfg
+    #     )  
 
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
@@ -38,7 +38,7 @@ def main(cfg: DictConfig) -> None:
          )   
         return
     elif cfg.app == "train":
-        train = trainers.rel_trainer
+        train = trainers.rel_trainer # TODO change depending on cfg
         # set up the distributed training environment
         if cfg.distributed.backend == "gloo":
             n_devices = torch.cuda.device_count()

@@ -1,6 +1,8 @@
 import os
 import time
 
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.distributed as dist
 from relbench.data import RelBenchDataset
@@ -11,6 +13,8 @@ from relbench.data.database import Database
 from torch_geometric.data import HeteroData
 from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
 from relbench.data import NodeTask
+from data.rel_dataset import DistrRelBenchDataset
+
 from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.distributed.local_feature_store import LocalFeatureStore
 from torch_geometric.distributed.local_graph_store import LocalGraphStore
@@ -23,9 +27,10 @@ from comm_utils import get_boundary_nodes_pyg
 
 def train(
     graph: HeteroData,
-    feat_store: LocalFeatureStore,
-    graph_store: LocalGraphStore,
+    node_dict: Dict,
+    local_dict: Dict,
     table_input: NodeTrainTableInput,
+    dataset: DistrRelBenchDataset,
     task: NodeTask,
     cfg: DictConfig,
     hydra_output_dir: str,
@@ -44,7 +49,7 @@ def train(
     None
     """
     
-    get_boundary_nodes_pyg(graph_store, feat_store)
+    get_boundary_nodes_pyg(graph, table_input, node_dict, local_dict)
 
     
     # TODO
@@ -77,20 +82,20 @@ def init_process(rank, cfg, hydra_output_dir):
     # TODO
     # 1. Load the partition directly (using rank)
     
-    dataset, task, feat_store, graph_store = load_rel_partition(partition_dir=cfg.partition_dir, dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=rank)
+    dataset, task, node_dict, local_dict = load_rel_partition(partition_dir=(f"{cfg.partition_dir}/{cfg.dataset_name}"), dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=rank)
     col_to_stype_dict = dataset2inferred_stypes[cfg.dataset_name]
-    # graph, col_stats_dict = make_pkey_fkey_graph(
-    #     dataset.db,
-    #     col_to_stype_dict=col_to_stype_dict,
-    #     text_embedder_cfg=TextEmbedderConfig(
-    #         text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
-    #     ),
-    #     cache_dir=os.path.join(cfg.partition_dir, f"{cfg.dataset_name}_materialized_cache"),
-    # )
+    graph, col_stats_dict = make_pkey_fkey_graph(
+        dataset.db,
+        col_to_stype_dict=col_to_stype_dict,
+        text_embedder_cfg=TextEmbedderConfig(
+            text_embedder=GloveTextEmbedding(device=cfg.device), batch_size=256
+        ),
+        cache_dir=os.path.join(cfg.partition_dir, f"materialized_cache/{rank}"),
+    )
 
-    # table_input = get_node_train_table_input(table=task.train_table, task=task)
+    table_input = get_node_train_table_input(table=task.train_table, task=task)
     # graph = None
-    table_input = None
+    # table_input = None
     
     os.makedirs("results/", exist_ok=True)
     os.makedirs(
@@ -107,10 +112,11 @@ def init_process(rank, cfg, hydra_output_dir):
     start_time = time.time()
     
     train(
-        None,
-        feat_store,
-        graph_store,
+        graph,
+        node_dict,
+        local_dict,
         table_input,
+        dataset,
         task,
         cfg,
         hydra_output_dir,

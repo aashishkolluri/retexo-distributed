@@ -3,10 +3,10 @@
 app: "train" # train, partition_data, partition_relational_data
 dataset_name: "rel-stackex"
 dataset_dir: ../retexo-datasets/
-partition_dir: ./data/rel-stackex
+partition_dir: ./data
 partition_method: "random"
 part_obj: "vol"
-num_partitions: 4
+num_partitions: 2
 num_layers: 2
 hidden_dim: 256
 num_rounds: [200, 200, 200]

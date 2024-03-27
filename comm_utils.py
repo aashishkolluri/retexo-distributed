@@ -5,6 +5,7 @@ from multiprocessing.pool import ThreadPool
 import time
 import dgl # type: ignore
 from dgl.distributed import GraphPartitionBook # type: ignore
+from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
 from torch_geometric.distributed.local_feature_store import LocalFeatureStore
 from torch_geometric.distributed.local_graph_store import LocalGraphStore
 from torch_geometric.data import HeteroData
@@ -105,7 +106,7 @@ def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
     return boundary
 
 
-def get_boundary_nodes_pyg(graph_store: LocalGraphStore, feats: LocalFeatureStore):
+def get_boundary_nodes_pyg(graph: HeteroData, table_input: NodeTrainTableInput, node_dict: Dict, local_dict: Dict):
     """Get the boundary nodes"""
 
     rank, size = dist.get_rank(), dist.get_world_size()
@@ -117,10 +118,10 @@ def get_boundary_nodes_pyg(graph_store: LocalGraphStore, feats: LocalFeatureStor
         left = (rank - i + size) % size
         right = (rank + i) % size
         
-        feats.get_tensor_from_global_id
-        for j in range(len(feats.meta["node_types"])):
-            node_type = feats.meta["node_types"][j]
-            belong_right = feats.node_feat_pb[node_type] == right
+        for node_type in graph.node_types:
+            belong_right = local_dict[node_type]["part_id"] == right
+            ids = local_dict[node_type]["GlobalId"][belong_right]
+            
             num_right = belong_right.sum().view(-1)
             if dist.get_backend() == "gloo":
                 num_right = num_right.cpu()
@@ -129,36 +130,37 @@ def get_boundary_nodes_pyg(graph_store: LocalGraphStore, feats: LocalFeatureStor
                 num_left = torch.tensor([0], device=device)
             req = dist.isend(num_right, dst=right)
             dist.recv(num_left, src=left)
-            feats.partition_idx
-            node_offset = feats.meta["node_offset"][j]
-            # v = feats.[node_type][belong_right]
+            # start = gpb.partid2nids(right)[0].item()
+            # v = node_info_dict[dgl.NID][belong_right] - start
+            v = ids
             if dist.get_backend() == "gloo":
                 v = v.cpu()
-                u = torch.zeros(num_left, dtype=torch.long)
+                u = torch.zeros(num_left, dtype=torch.long) # type: ignore
 
-        belong_right = graph.node_pb == right
-        num_right = belong_right.sum().view(-1)
-        if dist.get_backend() == "gloo":
-            num_right = num_right.cpu()
-            num_left = torch.tensor([0])
-        else:
-            num_left = torch.tensor([0], device=device)
-        req = dist.isend(num_right, dst=right)
-        dist.recv(num_left, src=left)
-        start = gpb.partid2nids(right)[0].item()
-        v = node_info_dict[dgl.NID][belong_right] - start
-        if dist.get_backend() == "gloo":
-            v = v.cpu()
-            u = torch.zeros(num_left, dtype=torch.long) # type: ignore
-
-        req.wait()
-        req = dist.isend(v, dst=right)
-        dist.recv(u, src=left)
-        # u, _ = torch.sort(u)
-
-        if dist.get_backend() == "gloo":
-            boundary[left] = u
-        req.wait()
+            req.wait()
+            req = dist.isend(v, dst=right)
+            dist.recv(u, src=left)
+            
+            if dist.get_backend() == "gloo":
+                boundary[left] = u
+            req.wait()
+            
+            # node_type = feats.meta["node_types"][j]
+            # belong_right = feats.node_feat_pb[node_type] == right
+            # num_right = belong_right.sum().view(-1)
+            # if dist.get_backend() == "gloo":
+            #     num_right = num_right.cpu()
+            #     num_left = torch.tensor([0])
+            # else:
+            #     num_left = torch.tensor([0], device=device)
+            # req = dist.isend(num_right, dst=right)
+            # dist.recv(num_left, src=left)
+            # feats.partition_idx
+            # node_offset = feats.meta["node_offset"][j]
+            # # v = feats.[node_type][belong_right]
+            # if dist.get_backend() == "gloo":
+            #     v = v.cpu()
+            #     u = torch.zeros(num_left, dtype=torch.long)
 
     return boundary
 

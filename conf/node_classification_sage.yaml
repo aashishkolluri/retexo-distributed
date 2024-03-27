@@ -63,4 +63,5 @@ distributed:
   master_port: "10011"
 
 task:
+  name: "node_classification_sage"
   _target_: tasks.node_classification.NodeClassificationTask
