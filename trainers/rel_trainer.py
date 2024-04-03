@@ -39,18 +39,56 @@ def train(
     """Implement end-to-end training process
     
     Parameters
-    ----------
-    TODO
-    
-    
+    ----------    
     
     Returns
     -------
     None
     """
     
-    get_boundary_nodes_pyg(graph, table_input, node_dict, local_dict)
+    # set the seed
+    set_torch_seed(cfg.seed)
+    
+    # setup the model
+    # TODO retrieve correct dimensions (as in Relbench)
+    model = instantiate(cfg.model, input_dim=0, output_dim=1)
+    device = cfg.device
+    if device == "cuda":
+        model = model.cuda()
+    # TODO incorporate performance stores
+    # perf_stores = [PerformanceStore()]
+    # perf_store = perf_stores[0]
+    
+    rank = dist.get_rank()
+    os.makedirs(os.path.join(hydra_output_dir, "results"), exist_ok=True)
+    if rank == 0:
+        os.makedirs(os.path.join(hydra_output_dir, "checkpoint"), exist_ok=True)
+    
+    # get the boundary nodes lists
+    boundary_nodes = get_boundary_nodes_pyg(graph, table_input, node_dict, local_dict)
 
+    # TODO check where to store embeddings ? Where in relbench?
+    # => in relbench's data graph there is an "embedding" field for each table
+    # TODO find out how many nodes we have locally
+    # TODO should we store per table? or just for "TableInput" nodes ? 
+    # => last answer should be in relbench paper
+    local_dict["feat_0"] = torch.zeros((len(nodes)), num_feat)
+    # TODO retrieve inner node indices, find out what torch.arrange does
+    inner_node_indices =  torch.arrange(node_dict["part_id"] == rank)
+    local_dict["feat_0"][inner_node_indices] = # TODO the features we know
+    
+    # are "features" what we computed in the "task" ? 
+    # we do message passing because inner_nodes have the most accurate embeddings,
+    # we can't compute the true embedding of boundary nodes locally.
+    # TODO raises the question of are the inner_nodes in my partitioning
+    # true inner nodes? For users yes, but the rest I am not sure. 
+    # Hopefully we have "more" inner nodes than thought
+    
+    # Share the zeroth embedding of all nodes to their neighbors
+    send_and_receive_embeddings_pyg(
+        boundary_nodes, node_dict, "feat_0", 
+    )
+    
     
     # TODO
     # - get boundary nodes

@@ -62,7 +62,11 @@ def send_and_receive_embeddings(
             perf_store.add_cv_message_passing_t(cv)
         node_info_dict[layer_tag][recv_boundary_node_indices] = new_features
 
-
+def send_and_receive_embeddings_pyg(
+    boundary_node_lists: List[torch.Tensor], node_info_dict: Dict, layer_tag: str
+):
+    raise NotImplementedError
+    
 def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
     """
     Get the boundary nodes
@@ -111,7 +115,7 @@ def get_boundary_nodes_pyg(graph: HeteroData, table_input: NodeTrainTableInput, 
 
     rank, size = dist.get_rank(), dist.get_world_size()
     device = "cuda"
-    boundary = [None] * size
+    boundary = [None] * size # TODO 
 
 
     for i in range(1, size):
@@ -120,6 +124,7 @@ def get_boundary_nodes_pyg(graph: HeteroData, table_input: NodeTrainTableInput, 
         
         for node_type in graph.node_types:
             belong_right = local_dict[node_type]["part_id"] == right
+            # TODO: have tensors
             ids = local_dict[node_type]["GlobalId"][belong_right]
             
             num_right = belong_right.sum().view(-1)
@@ -140,6 +145,7 @@ def get_boundary_nodes_pyg(graph: HeteroData, table_input: NodeTrainTableInput, 
             req.wait()
             req = dist.isend(v, dst=right)
             dist.recv(u, src=left)
+            # TODO: u is a tensor, good?
             
             if dist.get_backend() == "gloo":
                 boundary[left] = u
