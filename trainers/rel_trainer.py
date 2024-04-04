@@ -9,6 +9,7 @@ from relbench.data import RelBenchDataset
 from data.dataset import load_rel_partition
 from relbench.datasets import get_dataset
 from relbench.data.database import Database
+from models import RelModel
 
 from torch_geometric.data import HeteroData
 from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
@@ -21,9 +22,19 @@ from torch_geometric.distributed.local_graph_store import LocalGraphStore
 
 from text_embedder import GloveTextEmbedding
 from inferred_stypes import dataset2inferred_stypes
+from hydra.utils import instantiate
 from omegaconf import DictConfig
 from comm_utils import get_boundary_nodes_pyg
 
+
+def set_torch_seed(seed):
+    """Set the seed for torch"""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def train(
     graph: HeteroData,
@@ -31,6 +42,7 @@ def train(
     local_dict: Dict,
     table_input: NodeTrainTableInput,
     dataset: DistrRelBenchDataset,
+    col_stats_dict: Dict,
     task: NodeTask,
     cfg: DictConfig,
     hydra_output_dir: str,
@@ -50,11 +62,21 @@ def train(
     set_torch_seed(cfg.seed)
     
     # setup the model
-    # TODO retrieve correct dimensions (as in Relbench)
-    model = instantiate(cfg.model, input_dim=0, output_dim=1)
+    model = RelModel(
+        data=graph,
+        col_stats_dict=col_stats_dict,
+        num_layers=cfg.num_layers,
+        channels=cfg.channels,
+        out_channels=cfg.out_channels,
+        aggr=cfg.model.aggregator_type,
+        norm="batch_norm",
+    )#.to(device) ???
+    # TODO maybe setup optimizer later ? 
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
     device = cfg.device
     if device == "cuda":
         model = model.cuda()
+        
     # TODO incorporate performance stores
     # perf_stores = [PerformanceStore()]
     # perf_store = perf_stores[0]
@@ -72,6 +94,8 @@ def train(
     # TODO find out how many nodes we have locally
     # TODO should we store per table? or just for "TableInput" nodes ? 
     # => last answer should be in relbench paper
+    
+    
     local_dict["feat_0"] = torch.zeros((len(nodes)), num_feat)
     # TODO retrieve inner node indices, find out what torch.arrange does
     inner_node_indices =  torch.arrange(node_dict["part_id"] == rank)
@@ -155,6 +179,7 @@ def init_process(rank, cfg, hydra_output_dir):
         local_dict,
         table_input,
         dataset,
+        col_stats_dict,
         task,
         cfg,
         hydra_output_dir,
