@@ -67,7 +67,7 @@ def train(
     # get the boundary nodes lists
     boundary_nodes = get_boundary_nodes_pyg(graph, table_input, node_dict, local_dict)
 
-    # TODO check where to store embeddings ? Where in relbench?
+    # where to store embeddings ? Where in relbench?
     # => in relbench's data graph there is an "embedding" field for each table
     # TODO find out how many nodes we have locally
     # TODO should we store per table? or just for "TableInput" nodes ? 
@@ -75,14 +75,8 @@ def train(
     local_dict["feat_0"] = torch.zeros((len(nodes)), num_feat)
     # TODO retrieve inner node indices, find out what torch.arrange does
     inner_node_indices =  torch.arrange(node_dict["part_id"] == rank)
-    local_dict["feat_0"][inner_node_indices] = # TODO the features we know
+    local_dict["feat_0"][inner_node_indices] = # TODO the features we know? here we have not instanciated the task yet ! 
     
-    # are "features" what we computed in the "task" ? 
-    # we do message passing because inner_nodes have the most accurate embeddings,
-    # we can't compute the true embedding of boundary nodes locally.
-    # TODO raises the question of are the inner_nodes in my partitioning
-    # true inner nodes? For users yes, but the rest I am not sure. 
-    # Hopefully we have "more" inner nodes than thought
     
     # Share the zeroth embedding of all nodes to their neighbors
     send_and_receive_embeddings_pyg(
@@ -90,14 +84,39 @@ def train(
     )
     
     
+    for table, table_name in task.:
+        # TODO create 3 batches, given eah task table
+       subgraph =  create_subgraph(graph, table, node_dict, local_dict)
+       more_variables =...
+       
+    # TODO adapt for pyg graph
+    emb_data_thread = threading.Thread(
+        target=construct_graph_and_features_to_compute_next_embedding,
+        args=(emb_data_dict, task, graph, node_dict, prev_feat_tag, inner_node_indices),
+    )
+    emb_data_thread.start()
+    
+    # train for one layer
     # TODO
-    # - get boundary nodes
-    # - send and receive embeddings
-    # - start training by layer
-    # - msg passing in-between layers
-    # - model update
-    # - evaluate model
-    # - save model
+    
+    # send and receive embeddings, prepare next
+    # TODO
+    
+    # Do each remaining layer
+    # TODO
+    
+    # Display and save results
+    # TODO
+    
+    
+    # === -- notes & questions to myself -- ===
+    # are "features" what we computed in the "task" ? 
+    # we do message passing because inner_nodes have the most accurate embeddings,
+    # we can't compute the true embedding of boundary nodes locally.
+    # TODO raises the question of are the inner_nodes in my partitioning
+    # true inner nodes? For users yes, but the rest I am not sure. 
+    # Hopefully we have "more" inner nodes than thought
+
     
     raise NotImplementedError
 
