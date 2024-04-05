@@ -9,7 +9,7 @@ from relbench.data import RelBenchDataset
 from data.dataset import load_rel_partition
 from relbench.datasets import get_dataset
 from relbench.data.database import Database
-from models import RelModel
+from models.rel_model import RelModel
 
 from torch_geometric.data import HeteroData
 from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
@@ -19,12 +19,13 @@ from data.rel_dataset import DistrRelBenchDataset
 from torch_frame.config.text_embedder import TextEmbedderConfig
 from torch_geometric.distributed.local_feature_store import LocalFeatureStore
 from torch_geometric.distributed.local_graph_store import LocalGraphStore
+from torch_geometric.loader import NeighborLoader
 
 from text_embedder import GloveTextEmbedding
 from inferred_stypes import dataset2inferred_stypes
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from comm_utils import get_boundary_nodes_pyg
+from comm_utils import get_boundary_nodes_pyg, send_and_receive_embeddings_pyg
 
 
 def set_torch_seed(seed):
@@ -36,11 +37,19 @@ def set_torch_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+# def get_in_subgraph(
+#     graph: HeteroData, table_input: NodeTrainTableInput
+# ):
+#     nodes, filter_edge_idx, inv, edge_mask = 
+#     subgraph_edge_attr = graph.edge_attr[edge_mask] if graph.edge_attr is not None else graph.edge_attr
+#     sub_g = HeteroData(x=graph.x[nodes], edge_index=filter_edge_idx,
+#                                  edge_attr=subgraph_edge_attr)
+    
+
 def train(
     graph: HeteroData,
     node_dict: Dict,
     local_dict: Dict,
-    table_input: NodeTrainTableInput,
     dataset: DistrRelBenchDataset,
     col_stats_dict: Dict,
     task: NodeTask,
@@ -81,13 +90,13 @@ def train(
     # perf_stores = [PerformanceStore()]
     # perf_store = perf_stores[0]
     
-    rank = dist.get_rank()
+    rank, cluster_size = dist.get_rank(), size.get_world_size()
     os.makedirs(os.path.join(hydra_output_dir, "results"), exist_ok=True)
     if rank == 0:
         os.makedirs(os.path.join(hydra_output_dir, "checkpoint"), exist_ok=True)
     
     # get the boundary nodes lists
-    boundary_nodes = get_boundary_nodes_pyg(graph, table_input, node_dict, local_dict)
+    boundary_nodes = get_boundary_nodes_pyg(graph, node_dict, local_dict)
 
     # where to store embeddings ? Where in relbench?
     # => in relbench's data graph there is an "embedding" field for each table
@@ -99,7 +108,7 @@ def train(
     local_dict["feat_0"] = torch.zeros((len(nodes)), num_feat)
     # TODO retrieve inner node indices, find out what torch.arrange does
     inner_node_indices =  torch.arrange(node_dict["part_id"] == rank)
-    local_dict["feat_0"][inner_node_indices] = # TODO the features we know? here we have not instanciated the task yet ! 
+    local_dict["feat_0"][inner_node_indices] = 0# TODO the features we know? here we have not instanciated the task yet ! 
     
     
     # Share the zeroth embedding of all nodes to their neighbors
@@ -107,18 +116,38 @@ def train(
         boundary_nodes, node_dict, "feat_0", 
     )
     
-    
-    for table, table_name in task.:
-        # TODO create 3 batches, given eah task table
-       subgraph =  create_subgraph(graph, table, node_dict, local_dict)
-       more_variables =...
-       
+    # Create the 3 full-batches
+    batch_dict: Dict[str, HeteroData] = {}
+    for split, table in [
+        ("train", task.train_table),
+        ("val", task.val_table),
+        ("test", task.test_table),
+    ]:
+        table_input = get_node_train_table_input(table=table, task=task)
+        entity_table = table_input.nodes[0]
+        
+        batch = list(NeighborLoader(
+            graph,
+            num_neighbors=[-1], # one layer batch with all neighbors
+            time_attr="time",
+            input_nodes=table_input.nodes,
+            input_time=table_input.time,
+            transform=table_input.transform,
+            batch_size=graph.num_nodes, # whole graph
+            temporal_strategy=cfg.temporal_strategy,
+            shuffle=split == "train",
+            num_workers=4,
+            persistent_workers=4 > 0,
+        ))
+        assert(len(batch) == 1)
+        batch_dict[split] = batch[0]
+        
     # TODO adapt for pyg graph
-    emb_data_thread = threading.Thread(
-        target=construct_graph_and_features_to_compute_next_embedding,
-        args=(emb_data_dict, task, graph, node_dict, prev_feat_tag, inner_node_indices),
-    )
-    emb_data_thread.start()
+    # emb_data_thread = threading.Thread(
+    #     target=construct_graph_and_features_to_compute_next_embedding,
+    #     args=(emb_data_dict, task, graph, node_dict, prev_feat_tag, inner_node_indices),
+    # )
+    # emb_data_thread.start()
     
     # train for one layer
     # TODO
@@ -174,7 +203,7 @@ def init_process(rank, cfg, hydra_output_dir):
         cache_dir=os.path.join(cfg.partition_dir, f"materialized_cache/{rank}"),
     )
 
-    table_input = get_node_train_table_input(table=task.train_table, task=task)
+    # table_input = get_node_train_table_input(table=task.train_table, task=task)
     # graph = None
     # table_input = None
     
@@ -191,12 +220,13 @@ def init_process(rank, cfg, hydra_output_dir):
     results_dir = f"results/{cfg.dataset.partition.dataset_name}_{cfg.model.conv_layer._target_}_{cfg.dataset.partition.num_parts}/rank_{rank}/"
     
     start_time = time.time()
+
+        
     
     train(
         graph,
         node_dict,
         local_dict,
-        table_input,
         dataset,
         col_stats_dict,
         task,

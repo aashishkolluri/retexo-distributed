@@ -110,7 +110,7 @@ def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
     return boundary
 
 
-def get_boundary_nodes_pyg(graph: HeteroData, table_input: NodeTrainTableInput, node_dict: Dict, local_dict: Dict):
+def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict):
     """Get the boundary nodes"""
 
     rank, size = dist.get_rank(), dist.get_world_size()

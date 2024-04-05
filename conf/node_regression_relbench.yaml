@@ -9,6 +9,7 @@ part_obj: "vol"
 num_partitions: 2
 num_layers: 2
 channels: 32
+temporal_strategy: "uniform"
 out_channels: 1
 hidden_dim: 256
 num_rounds: [200, 200, 200]

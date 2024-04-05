@@ -19,8 +19,8 @@ from relbench.tasks.stackex import VotesTask
 class DistrStackExDataset(DistrRelBenchDataset):
     name = "rel-stackex"
     # 2 years gap
-    val_timestamp = pd.Timestamp("2019-01-01")
-    test_timestamp = pd.Timestamp("2021-01-01")
+    val_timestamp = pd.Timestamp("2017-01-01")# TODO WAS 2019
+    test_timestamp = pd.Timestamp("2019-01-01") # TODO WAS 2021
     max_eval_time_frames = 1
     
     task_cls_list = [
