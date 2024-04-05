@@ -1,10 +1,14 @@
 import os
 import time
+import copy
+import logging
 
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn import L1Loss
 from relbench.data import RelBenchDataset
 from data.dataset import load_rel_partition
 from relbench.datasets import get_dataset
@@ -21,12 +25,16 @@ from torch_geometric.distributed.local_feature_store import LocalFeatureStore
 from torch_geometric.distributed.local_graph_store import LocalGraphStore
 from torch_geometric.loader import NeighborLoader
 
+from performance import PerformanceStore
 from text_embedder import GloveTextEmbedding
 from inferred_stypes import dataset2inferred_stypes
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from comm_utils import get_boundary_nodes_pyg, send_and_receive_embeddings_pyg
+from comm_utils import get_boundary_nodes_pyg, send_and_receive_embeddings_pyg, sync_model, MultiThreadReducerCentralized
+from trainers.worker_trainer import WorkerTrain
 
+logger = logging.getLogger(__name__)
+comm_volume_perf_store = PerformanceStore()
 
 def set_torch_seed(seed):
     """Set the seed for torch"""
@@ -44,7 +52,110 @@ def set_torch_seed(seed):
 #     subgraph_edge_attr = graph.edge_attr[edge_mask] if graph.edge_attr is not None else graph.edge_attr
 #     sub_g = HeteroData(x=graph.x[nodes], edge_index=filter_edge_idx,
 #                                  edge_attr=subgraph_edge_attr)
+
+def setup_model(entire_model, curr_layer, device):
+    """Set up the model"""
+    # train the nth layer of the model
+    curr_model = entire_model.get_nth_layer(curr_layer)
+    if device == "cuda":
+        curr_model = curr_model.cuda()
+    return curr_model
+
     
+def train_for_one_layer(
+    model: RelModel,
+    task,
+    batch_dict: Dict[str, HeteroData],
+    optimizer,
+    tune_metric: str,   
+    loss_fn,
+    entity_table,
+    cfg,
+    num_rounds,
+    clamp_min, 
+    clamp_max,
+    worker_trainer):
+    """Train for one layer"""
+    if cfg.device == "cuda":
+        traindata = [batch_dict["train"].to(torch.device("cuda"))]
+        valdata = [batch_dict["val"].to(torch.device("cuda"))]
+        testdata = [batch_dict["test"].to(torch.device("cuda"))]
+    
+    rank = dist.get_rank()
+    if rank == 0:
+        best_params = model.state_dict()
+        best_val_loss = float("inf")
+        best_val_acc = 0.0
+        best_test_acc = 0.0
+        best_val_metrics = None
+        best_epoch = 0
+
+    reducer = MultiThreadReducerCentralized(
+        model, cfg.sleep_time, comm_volume_perf_store, cfg.measure_dv
+    )
+    
+    def train_one_round() -> float:
+        model.train()
+
+        batch = batch.to(cfg.device)
+        optimizer.zero_grad()
+        pred = model(
+            batch,
+            task.entity_table,
+        )
+        pred = pred.view(-1) if pred.size(1) == 1 else pred
+        loss = loss_fn(pred, batch[entity_table].y)
+        loss.backward()
+
+        return (loss.detach().item() * pred.size(0)) / pred.size(0)
+        
+    # do all rounds on current layer
+    for training_round in range(num_rounds):
+
+        
+        start_time = time.time()
+        train_loss = train_one_round()
+        time_round = time.time() - start_time
+        
+        val_pred = test(batch_dict["val"], model, cfg.device, clamp_min, clamp_max, task)
+        val_metrics = task.evaluate(val_pred, task.val_table)
+        
+        agg_time_s = time.time()
+        with torch.no_grad():
+            reducer.aggregate_grad(model, num_local_train, num_train)
+        agg_time = time.time() - agg_time_s
+        
+        optimizer.step()
+       
+
+        higher_is_better = False # True for classification, False for regression
+        if (higher_is_better and val_metrics[tune_metric] > best_val_metric) or (
+            not higher_is_better and val_metrics[tune_metric] < best_val_metric
+        ):
+            best_val_metric = val_metrics[tune_metric]
+            state_dict = copy.deepcopy(model.state_dict())
+        
+        # sync the val metrics
+    
+@torch.no_grad()
+def test(batch: HeteroData, model, device, clamp_min, clamp_max, task) -> np.ndarray:
+    model.eval()
+
+    pred_list = []
+    batch = batch.to(device)
+    pred = model(
+        batch,
+        task.entity_table,
+    )
+    pred = torch.clamp(pred, clamp_min, clamp_max)
+    pred = pred.view(-1) if pred.size(1) == 1 else pred
+    
+    detached = pred.detach().cpu()
+    pred_list.append(detached)
+    
+    res = torch.cat(pred_list, dim=0).numpy()
+    return res
+
 
 def train(
     graph: HeteroData,
@@ -81,11 +192,15 @@ def train(
         norm="batch_norm",
     )#.to(device) ???
     # TODO maybe setup optimizer later ? 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
+    
     device = cfg.device
     if device == "cuda":
         model = model.cuda()
-        
+    
+    if isinstance(cfg.learning_rate, float):
+        cfg.learning_rate = [cfg.learning_rate]
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
+   
     # TODO incorporate performance stores
     # perf_stores = [PerformanceStore()]
     # perf_store = perf_stores[0]
@@ -149,15 +264,46 @@ def train(
     # )
     # emb_data_thread.start()
     
+    tune_metric = "mae"
+    loss_fn = L1Loss()
+    clamp_min, clamp_max = np.percentile(
+        task.train_table.df[task.target_col].to_numpy(), [2, 98]
+    )
+    
+    worker_trainer = WorkerTrain()
+    if isinstance(cfg.num_rounds, int):
+        cfg.num_rounds = [cfg.num_rounds]
+    
     # train for one layer
     # TODO
+    train_for_one_layer(
+        model,
+        batch_dict,
+        optimizer,
+        tune_metric,   
+        loss_fn,
+        entity_table,
+        cfg,
+        clamp_min,
+        clamp_max,
+        cfg.num_rounds[0],
+        worker_trainer
+    )
     
-    # send and receive embeddings, prepare next
-    # TODO
-    
-    # Do each remaining layer
-    # TODO
-    
+    for curr_layer in range(1, cfg.model.n_layers):
+        # send and receive embeddings, prepare next
+        # TODO
+
+        # - get features
+        
+        # - get local embeddings
+        # - send and receive embeddings
+        
+        # - prepare next layer (data, graph, model, optimizer)
+        
+        # - train for one layer
+
+
     # Display and save results
     # TODO
     
