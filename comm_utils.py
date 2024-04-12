@@ -14,6 +14,9 @@ import torch.distributed as dist
 import torch
 import torch.nn as nn
 
+from torch_frame import stype
+
+
 
 
 def send_and_receive_embeddings(
@@ -42,6 +45,7 @@ def send_and_receive_embeddings(
 
         boundary_node_t = boundary_node_lists[part_id]
         features_corr = node_info_dict[layer_tag][boundary_node_t]
+
         send_req = dist.isend(features_corr, dst=part_id)
 
         recv_boundary_node_indices = torch.arange(len(node_info_dict["part_id"]))[
@@ -63,9 +67,48 @@ def send_and_receive_embeddings(
         node_info_dict[layer_tag][recv_boundary_node_indices] = new_features
 
 def send_and_receive_embeddings_pyg(
-    boundary_node_lists: List[torch.Tensor], node_info_dict: Dict, layer_tag: str
+    graph: HeteroData, boundary_node_lists: List[torch.Tensor], node_info_dict: Dict, local_dict: Dict, layer_tag: str
 ):
-    raise NotImplementedError
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    # send_reqs = []
+    for part_id in range(world_size):
+        if part_id == rank:
+            continue
+        
+        for node_type in graph.node_types:
+            boundary_node_t = boundary_node_lists[node_type][part_id]
+            
+            
+            local_mask = torch.isin(torch.tensor(local_dict[node_type]["GlobalId"].to_numpy()), boundary_node_t)
+            features_corr =  graph[node_type]["tf"][local_mask[:graph[node_type]["tf"].num_rows]]
+            
+            # ignoring node types with no embeddings:
+            if stype.embedding not in features_corr.feat_dict:
+                continue
+            
+            embeddings = features_corr.feat_dict[stype.embedding].values
+            # can use features_corr.embeddings.values
+            send_req = dist.isend(embeddings, dst=part_id)
+
+
+            recv_mask = torch.isin(torch.tensor(local_dict[node_type]["part_id"].to_numpy()), part_id)
+            # recv_boundary_node_indices = torch.arange(len(local_dict[node_type]["GlobalId"]))[
+            #     local_dict[node_type]["part_id"] == part_id
+            # ]
+            new_features = torch.zeros(
+                recv_mask.sum().item(),
+                embeddings.shape[1], 
+                device=graph[node_type]["tf"].device,
+            )
+            dist.recv(new_features, src=part_id)
+            send_req.wait()
+            
+            # TODO is it enough to just update "values" ??? (what about other attributes of embeddings?)
+            graph[node_type]["tf"][recv_mask[:graph[node_type]["tf"].num_rows]].feat_dict[stype.embedding].values = new_features
+            # node_info_dict[node_type][layer_tag][recv_boundary_node_indices] = new_features
+
     
 def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
     """
@@ -115,7 +158,10 @@ def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict)
 
     rank, size = dist.get_rank(), dist.get_world_size()
     device = "cuda"
-    boundary = [None] * size # TODO 
+    
+    boundary = {}
+    for node_type in graph.node_types:
+        boundary[node_type] = [None] * size 
 
 
     for i in range(1, size):
@@ -124,10 +170,9 @@ def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict)
         
         for node_type in graph.node_types:
             belong_right = local_dict[node_type]["part_id"] == right
-            # TODO: have tensors
-            ids = local_dict[node_type]["GlobalId"][belong_right]
+            ids = torch.tensor(local_dict[node_type]["GlobalId"][belong_right].to_numpy())
             
-            num_right = belong_right.sum().view(-1)
+            num_right = torch.tensor(belong_right).sum().view(-1)
             if dist.get_backend() == "gloo":
                 num_right = num_right.cpu()
                 num_left = torch.tensor([0])
@@ -135,8 +180,7 @@ def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict)
                 num_left = torch.tensor([0], device=device)
             req = dist.isend(num_right, dst=right)
             dist.recv(num_left, src=left)
-            # start = gpb.partid2nids(right)[0].item()
-            # v = node_info_dict[dgl.NID][belong_right] - start
+
             v = ids
             if dist.get_backend() == "gloo":
                 v = v.cpu()
@@ -145,10 +189,9 @@ def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict)
             req.wait()
             req = dist.isend(v, dst=right)
             dist.recv(u, src=left)
-            # TODO: u is a tensor, good?
             
             if dist.get_backend() == "gloo":
-                boundary[left] = u
+                boundary[node_type][left] = u
             req.wait()
             
             # node_type = feats.meta["node_types"][j]

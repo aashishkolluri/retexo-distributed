@@ -13,14 +13,14 @@ import pooch
 from pathlib import Path
 from typing import List, Optional, Tuple, Type, Union
 from data.rel_dataset import DistrRelBenchDataset
-from relbench.tasks.stackex import VotesTask
+from data.tasks.stackex import VotesTask
 
 
 class DistrStackExDataset(DistrRelBenchDataset):
     name = "rel-stackex"
     # 2 years gap
-    val_timestamp = pd.Timestamp("2017-01-01")# TODO WAS 2019
-    test_timestamp = pd.Timestamp("2019-01-01") # TODO WAS 2021
+    val_timestamp = pd.Timestamp("2019-01-01")# TODO WAS 2019
+    test_timestamp = pd.Timestamp("2021-01-01") # TODO WAS 2021
     max_eval_time_frames = 1
     
     task_cls_list = [
@@ -173,21 +173,24 @@ class DistrStackExDataset(DistrRelBenchDataset):
         
         Datasets are stored in the cache."""
         
-        db = self.db
+        db = self._full_db
         
         shards = []
         
         # Users table
         users = db.table_dict["users"]
-        user_shards = np.array_split(users.df, num_shards)   
+        shuffled_users_df = users.df.sample(frac=1)
+        user_shards = np.array_split(shuffled_users_df, num_shards)   
+        
         for i in range(len(user_shards)):
             user_shards[i]["part_id"] = i
+            
         shards.append(
-                {"name": "users", 
-                    "df": user_shards, 
-                    "fk_to_table": users.fkey_col_to_pkey_table,
-                    "time_col": users.time_col
-                }
+            {"name": "users", 
+                "df": user_shards, 
+                "fk_to_table": users.fkey_col_to_pkey_table,
+                "time_col": users.time_col
+            }
         )
         
         # Votes table

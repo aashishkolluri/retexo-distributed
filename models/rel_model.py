@@ -103,13 +103,71 @@ class RelModel(torch.nn.Module):
         
         output = self.head(x_dict[entity_table][: seed_time.size(0)])        
         return output
-
-
-    def forward_first_layer(
+    
+    def get_emebeddings(
         self,
         batch: HeteroData,
         entity_table: NodeType,
-    )  -> Tensor:
+    ) -> Dict[NodeType, Tensor]:
+        seed_time = batch[entity_table].seed_time
+        x_dict = self.encoder(batch.tf_dict)
+
+        rel_time_dict = self.temporal_encoder(
+            seed_time, batch.time_dict, batch.batch_dict
+        )
+        
+        for node_type, rel_time in rel_time_dict.items():
+            x_dict[node_type] = x_dict[node_type] + rel_time
+
+        for node_type, embedding in self.embedding_dict.items():
+            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+         
+        return x_dict
+
+    def get_nth_layer(
+        self,
+        n: int,
+    ):
+        conv, norm = self.gnn.get_nth_layer(n)
+        mlp = MLP(
+            self.chan,
+            out_channels=self.out_chan,
+            norm=self.m_norm,
+            num_layers=1,
+        )
+        
+        # Not needed if we just use get_embeddings first
+        # if n == 0: 
+        #     return FirstLayerRelModel(
+        #         self.temporal_encoder,
+        #         self.encoder,
+        #         conv,
+        #         norm,
+        #         mlp,
+        #         self.embedding_dict
+        #     )
+         
+        return IntermediateRelModel(conv, norm, mlp)
+    
+    
+class FirstLayerRelModel(torch.nn.Module):
+    """Model with encoders, one convolution layer, and MLP"""
+
+    def __init__(self, temporal_encoder, encoder, conv, norm, mlp, embedding_dict) -> None:
+        super().__init__()
+        self.temporal_encoder = temporal_encoder
+        self.encoder = encoder
+        self.conv = conv
+        self.norm = norm
+        self.mlp = mlp
+        self.embedding_dict = embedding_dict
+
+    def forward(
+        self, 
+        batch: HeteroData,
+        entity_table: NodeType,
+    ) -> torch.Tensor:
+        """Forward pass"""
         seed_time = batch[entity_table].seed_time
         x_dict = self.encoder(batch.tf_dict)
 
@@ -123,41 +181,18 @@ class RelModel(torch.nn.Module):
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
             
-        x_dict = self.gnn.forward_nth_layer(
+        x_dict = self.conv(
             x_dict,
             batch.edge_index_dict,
-            0
+            batch.num_sampled_nodes_dict,
+            batch.num_sampled_edges_dict,
         )
         
-        output = self.head(x_dict[entity_table][: seed_time.size(0)])        
-        return output
-
-
-    def get_nth_layer(
-        self,
-        entity_table: NodeType,
-        seed_time,
-        x_dict: Dict[NodeType, Tensor],
-        edge_index_dict: Dict[NodeType, Tensor],
-        n: int,
-    ):
-        # seed_time = batch[entity_table].seed_time
-        
-        # TODO case first layer
-
-        conv, norm = self.gnn.get_nth_layer(n)
-        mlp = MLP(
-            self.chan,
-            out_channels=self.out_chan,
-            norm=self.m_norm,
-            num_layers=1,
-        )
-                
-        return IntermediateRelModel(conv, norm, mlp)
-    
+        output = self.mlp(x_dict[entity_table][: seed_time.size(0)])        
+        return output, x_dict
     
 class IntermediateRelModel(torch.nn.Module):
-    """Model with one aggregation layer and multiple following layers"""
+    """Model with one convolution layer and one MLP layer"""
 
     def __init__(self, conv, norm, mlp) -> None:
         super().__init__()
@@ -171,7 +206,6 @@ class IntermediateRelModel(torch.nn.Module):
         seed_time,
         x_dict: Dict[NodeType, Tensor],
         edge_index_dict: Dict[NodeType, Tensor],
-        n: int,
     ) -> torch.Tensor:
         """Forward pass"""
         x_dict = self.conv(x_dict, edge_index_dict)
@@ -179,4 +213,4 @@ class IntermediateRelModel(torch.nn.Module):
         x_dict = {key: x.relu() for key, x in x_dict.items()}
         
         output = self.mlp(x_dict[entity_table][: seed_time.size(0)])  
-        return output
+        return output, x_dict

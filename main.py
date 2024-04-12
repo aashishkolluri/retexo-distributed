@@ -20,7 +20,7 @@ def main(cfg: DictConfig) -> None:
 
     print(OmegaConf.to_yaml(cfg))
 
-    # load_rel_partition(cfg.partition_dir, cfg.dataset_name, cfg.task.name, 0) 
+    # load_rel_partition(partition_dir=(f"{cfg.partition_dir}/{cfg.dataset_name}"), dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=3)
     # rel_graph_partition(
     #     cfg.dataset_name, "data", cfg.num_partitions, cfg
     #     )  
@@ -39,6 +39,7 @@ def main(cfg: DictConfig) -> None:
         return
     elif cfg.app == "train":
         train = trainers.rel_trainer # TODO change depending on cfg
+        # train = trainers.trainer
         # set up the distributed training environment
         if cfg.distributed.backend == "gloo":
             n_devices = torch.cuda.device_count()
@@ -49,8 +50,9 @@ def main(cfg: DictConfig) -> None:
                 n_devices = len(devices)
 
             start_id = cfg.node_rank * cfg.parts_per_node
-            end_id = min(start_id + cfg.parts_per_node, cfg.num_partitions)
-
+            # end_id = min(start_id + cfg.parts_per_node, cfg.num_partitions) 
+            end_id = int(start_id + cfg.num_partitions / cfg.parts_per_node)
+            
             process = []
             torch.multiprocessing.set_start_method('spawn')
             for i in range(start_id, end_id):

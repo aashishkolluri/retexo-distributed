@@ -138,8 +138,8 @@ class HeteroGraphSAGE(torch.nn.Module):
         self.convs = torch.nn.ModuleList()
         for _ in range(num_layers):
             conv = HeteroConv(
-                {
-                    edge_type: CustomSAGEConv((channels, channels), channels, aggr=aggr)
+                {   # Here replaced in_feats by just channels instead of (channels, channels)
+                    edge_type: CustomSAGEConv(channels , channels, aggregator_type=aggr)
                     for edge_type in edge_types
                 },
                 aggr="sum",

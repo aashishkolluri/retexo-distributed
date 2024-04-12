@@ -76,6 +76,7 @@ dataset2inferred_stypes = {
             "PostId": stype.numerical,
             "LinkTypeId": stype.numerical,
             "CreationDate": stype.timestamp,
+            "GlobalId": stype.numerical,
         },
         "posts": {
             "Id": stype.numerical,
@@ -90,6 +91,7 @@ dataset2inferred_stypes = {
             # "LastEditorDisplayName": stype.text_embedded,
             "Title": stype.text_embedded,
             "Tags": stype.text_embedded,
+            "GlobalId": stype.numerical,
         },
         "users": {
             "Id": stype.numerical,
@@ -101,6 +103,7 @@ dataset2inferred_stypes = {
             "AboutMe": stype.text_embedded,
             # Uninformative text column
             # "WebsiteUrl": stype.text_embedded,
+            "GlobalId": stype.numerical,
         },
         "votes": {
             "Id": stype.numerical,
@@ -108,6 +111,7 @@ dataset2inferred_stypes = {
             "VoteTypeId": stype.numerical,
             "UserId": stype.numerical,
             "CreationDate": stype.timestamp,
+            "GlobalId": stype.numerical,
         },
         "comments": {
             "Id": stype.numerical,
@@ -118,6 +122,7 @@ dataset2inferred_stypes = {
             # Uninformative text column
             # "UserDisplayName": stype.text_embedded,
             # "ContentLicense": stype.text_embedded,
+            "GlobalId": stype.numerical,
         },
         "badges": {
             "Id": stype.numerical,
@@ -127,6 +132,7 @@ dataset2inferred_stypes = {
             # "Name": stype.text_embedded,
             "Date": stype.timestamp,
             "TagBased": stype.categorical,
+            "GlobalId": stype.numerical,
         },
         "postHistory": {
             "Id": stype.numerical,
@@ -142,6 +148,7 @@ dataset2inferred_stypes = {
             # Uninformative text column
             # "Comment": stype.text_embedded,
             "CreationDate": stype.timestamp,
+            "GlobalId": stype.numerical,
         },
     },
     "rel-f1": {

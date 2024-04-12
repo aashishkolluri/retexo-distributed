@@ -30,7 +30,7 @@ from text_embedder import GloveTextEmbedding
 from inferred_stypes import dataset2inferred_stypes
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from comm_utils import get_boundary_nodes_pyg, send_and_receive_embeddings_pyg, sync_model, MultiThreadReducerCentralized
+from comm_utils import get_boundary_nodes_pyg, send_and_receive_embeddings_pyg, sync_model, aggregate_metrics, MultiThreadReducerCentralized
 from trainers.worker_trainer import WorkerTrain
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,8 @@ def train_for_one_layer(
     num_rounds,
     clamp_min, 
     clamp_max,
-    worker_trainer):
+    worker_trainer,
+    results_dir):
     """Train for one layer"""
     if cfg.device == "cuda":
         traindata = [batch_dict["train"].to(torch.device("cuda"))]
@@ -85,9 +86,9 @@ def train_for_one_layer(
     if rank == 0:
         best_params = model.state_dict()
         best_val_loss = float("inf")
-        best_val_acc = 0.0
-        best_test_acc = 0.0
-        best_val_metrics = None
+        # best_val_acc = 0.0
+        # best_test_acc = 0.0
+        best_val_metric = None
         best_epoch = 0
 
     reducer = MultiThreadReducerCentralized(
@@ -99,7 +100,7 @@ def train_for_one_layer(
 
         batch = batch.to(cfg.device)
         optimizer.zero_grad()
-        pred = model(
+        pred = model( # TODO is layer > 0 cannot give batch directly, need x_dict
             batch,
             task.entity_table,
         )
@@ -111,14 +112,10 @@ def train_for_one_layer(
         
     # do all rounds on current layer
     for training_round in range(num_rounds):
-
         
         start_time = time.time()
         train_loss = train_one_round()
         time_round = time.time() - start_time
-        
-        val_pred = test(batch_dict["val"], model, cfg.device, clamp_min, clamp_max, task)
-        val_metrics = task.evaluate(val_pred, task.val_table)
         
         agg_time_s = time.time()
         with torch.no_grad():
@@ -126,16 +123,53 @@ def train_for_one_layer(
         agg_time = time.time() - agg_time_s
         
         optimizer.step()
-       
-
-        higher_is_better = False # True for classification, False for regression
-        if (higher_is_better and val_metrics[tune_metric] > best_val_metric) or (
-            not higher_is_better and val_metrics[tune_metric] < best_val_metric
-        ):
-            best_val_metric = val_metrics[tune_metric]
-            state_dict = copy.deepcopy(model.state_dict())
+        
+        
+        val_pred = test(batch_dict["val"], model, cfg.device, clamp_min, clamp_max, task)
+        val_metrics = task.evaluate(val_pred, task.val_table)
         
         # sync the val metrics
+        for k, v in val_metrics.items():
+            val_metrics[k] = v * (num_local_val / num_val)
+        aggregate_metrics(val_metrics)
+            
+        if rank == 0:
+            # store the model with best val accuracy
+            higher_is_better = False # True for classification, False for regression
+            if (higher_is_better and val_metrics[tune_metric] > best_val_metric) or (
+                not higher_is_better and val_metrics[tune_metric] < best_val_metric
+            ):
+                best_val_metric = val_metrics[tune_metric]
+                best_params = copy.deepcopy(model.state_dict())
+                best_val_loss = val_metrics["loss"]
+                best_epoch = training_round
+
+
+        # TODO log every n round
+    
+    if rank == 0:
+        model.load_state_dict(best_params)
+    sync_model(model)
+    
+    test_pred = test(batch_dict["test"])
+    test_metrics = task.evaluate(test_pred)
+
+    for k, v in test_metrics.items():
+        test_metrics[k] = v * (num_local_test / num_test)
+    aggregate_metrics(test_metrics)
+
+    if rank == 0:
+        print(f"Best model at epoch {best_epoch} | loss {best_val_loss:5.4f}")
+        print(f"Best model val metrics: {best_val_metric}")
+        print(f"Best model test metrics: {test_metrics}")
+        # print(f"Best test accuracy achieved: {best_test_acc}")
+        print("-------------------------------------------" * 3)
+        with open(results_dir + "best_stats.txt", "a+") as f:
+            f.write(
+                f'Epoch {best_epoch}, {best_val_metric.item()}, {test_metrics.item()}\n'
+            )
+    
+    time.sleep(5)
     
 @torch.no_grad()
 def test(batch: HeteroData, model, device, clamp_min, clamp_max, task) -> np.ndarray:
@@ -181,6 +215,7 @@ def train(
     # set the seed
     set_torch_seed(cfg.seed)
     
+ 
     # setup the model
     model = RelModel(
         data=graph,
@@ -188,47 +223,28 @@ def train(
         num_layers=cfg.num_layers,
         channels=cfg.channels,
         out_channels=cfg.out_channels,
-        aggr=cfg.model.aggregator_type,
+        aggr=cfg.model.conv_layer.aggregator_type,
         norm="batch_norm",
     )#.to(device) ???
-    # TODO maybe setup optimizer later ? 
+   
+    perf_stores = [PerformanceStore()]
+    perf_store = perf_stores[0]
     
     device = cfg.device
     if device == "cuda":
         model = model.cuda()
+
     
-    if isinstance(cfg.learning_rate, float):
-        cfg.learning_rate = [cfg.learning_rate]
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
-   
-    # TODO incorporate performance stores
-    # perf_stores = [PerformanceStore()]
-    # perf_store = perf_stores[0]
-    
-    rank, cluster_size = dist.get_rank(), size.get_world_size()
+    rank, cluster_size = dist.get_rank(), dist.get_world_size()
     os.makedirs(os.path.join(hydra_output_dir, "results"), exist_ok=True)
     if rank == 0:
         os.makedirs(os.path.join(hydra_output_dir, "checkpoint"), exist_ok=True)
-    
-    # get the boundary nodes lists
-    boundary_nodes = get_boundary_nodes_pyg(graph, node_dict, local_dict)
 
-    # where to store embeddings ? Where in relbench?
-    # => in relbench's data graph there is an "embedding" field for each table
-    # TODO find out how many nodes we have locally
-    # TODO should we store per table? or just for "TableInput" nodes ? 
-    # => last answer should be in relbench paper
-    
-    
-    local_dict["feat_0"] = torch.zeros((len(nodes)), num_feat)
-    # TODO retrieve inner node indices, find out what torch.arrange does
-    inner_node_indices =  torch.arrange(node_dict["part_id"] == rank)
-    local_dict["feat_0"][inner_node_indices] = 0# TODO the features we know? here we have not instanciated the task yet ! 
-    
-    
-    # Share the zeroth embedding of all nodes to their neighbors
-    send_and_receive_embeddings_pyg(
-        boundary_nodes, node_dict, "feat_0", 
+    logger.info(
+        "Process %d has %d nodes and %d edges",
+        rank,
+        graph.num_nodes(),
+        graph.num_edges(),
     )
     
     # Create the 3 full-batches
@@ -251,19 +267,45 @@ def train(
             batch_size=graph.num_nodes, # whole graph
             temporal_strategy=cfg.temporal_strategy,
             shuffle=split == "train",
-            num_workers=4,
-            persistent_workers=4 > 0,
+            persistent_workers=False,
         ))
         assert(len(batch) == 1)
         batch_dict[split] = batch[0]
         
-    # TODO adapt for pyg graph
+    # inner_node_indices = {}
+    # for table_name, dataframe in node_dict.items():
+    #     # inner_node_indices[table_name] = {}
+    #     inner_node_indices[table_name] = dataframe['part_id'] == dist.get_rank()
+
+    # local_dict["feat_0"][inner_node_indices] = 0# TODO the features we know? here we have not instanciated the task yet !       
+        
+    batch_dict["train"].to(device)
+    local_dict["feat_0"] = model.get_emebeddings(batch_dict["train"], entity_table)
+    
+    # TODO extract embeddings and adapt for communications:
+    # emb_data_dict: Dict[str, Tuple[Any, Tensor, Tensor]] = {}
     # emb_data_thread = threading.Thread(
     #     target=construct_graph_and_features_to_compute_next_embedding,
     #     args=(emb_data_dict, task, graph, node_dict, prev_feat_tag, inner_node_indices),
     # )
-    # emb_data_thread.start()
+    # emb_data_thread.start() TODO maybe not in another thread for now
     
+    # get the boundary nodes lists
+    boundary_nodes = get_boundary_nodes_pyg(graph, node_dict, local_dict)
+    send_and_receive_embeddings_pyg(
+        graph, boundary_nodes, node_dict, local_dict, "feat_0", 
+    )
+    
+        
+    if isinstance(cfg.learning_rate, float):
+        cfg.learning_rate = [cfg.learning_rate]
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
+   
+    # set up the model for the first layer
+    curr_model = setup_model(model, 0, cfg.device)
+    sync_model(curr_model)
+    
+ 
     tune_metric = "mae"
     loss_fn = L1Loss()
     clamp_min, clamp_max = np.percentile(
@@ -274,8 +316,10 @@ def train(
     if isinstance(cfg.num_rounds, int):
         cfg.num_rounds = [cfg.num_rounds]
     
-    # train for one layer
-    # TODO
+   
+    prev_feat_tag = "feat_0"
+    
+    # train for first layer
     train_for_one_layer(
         model,
         batch_dict,
@@ -291,30 +335,75 @@ def train(
     )
     
     for curr_layer in range(1, cfg.model.n_layers):
-        # send and receive embeddings, prepare next
-        # TODO
-
-        # - get features
-        
         # - get local embeddings
+        # curr_feat_tag = "feat_" + str(curr_layer)
+        # local_dict[curr_feat_tag] = torch.zeros(
+        #     (len(node_dict[dgl.NID]), curr_feats.shape[1])
+        # )
+        # local_dict[curr_feat_tag][inner_node_indices] = curr_feats
+
         # - send and receive embeddings
+        send_and_receive_embeddings_pyg(
+            graph, boundary_nodes, node_dict, local_dict, "feat_0", 
+        )
         
         # - prepare next layer (data, graph, model, optimizer)
+        # TODO extract function
+        for split, table in [
+            ("train", task.train_table),
+            ("val", task.val_table),
+            ("test", task.test_table),
+        ]:
+            table_input = get_node_train_table_input(table=table, task=task)
+            entity_table = table_input.nodes[0]
+            
+            batch = list(NeighborLoader(
+                graph,
+                num_neighbors=[-1], # one layer batch with all neighbors
+                time_attr="time",
+                input_nodes=table_input.nodes,
+                input_time=table_input.time,
+                transform=table_input.transform,
+                batch_size=graph.num_nodes, # whole graph
+                temporal_strategy=cfg.temporal_strategy,
+                shuffle=split == "train",
+                persistent_workers=False,
+            ))
+            assert(len(batch) == 1)
+            batch_dict[split] = batch[0]
+            
+        model = setup_model(model, curr_layer, cfg.device)
+        sync_model(model)
         
+        # reset the optimizer
+        optimizer = instantiate(
+            cfg.optimizer,
+            lr=cfg.learning_rate[curr_layer]
+            if curr_layer < len(cfg.learning_rate)
+            else cfg.learning_rate[0],
+            params=model.parameters(),
+        )
+            
         # - train for one layer
-
+        train_for_one_layer(
+            model,
+            batch_dict,
+            optimizer,
+            tune_metric,   
+            loss_fn,
+            entity_table,
+            cfg,
+            clamp_min,
+            clamp_max,
+            cfg.num_rounds[0],
+            worker_trainer
+        )
 
     # Display and save results
     # TODO
     
     
     # === -- notes & questions to myself -- ===
-    # are "features" what we computed in the "task" ? 
-    # we do message passing because inner_nodes have the most accurate embeddings,
-    # we can't compute the true embedding of boundary nodes locally.
-    # TODO raises the question of are the inner_nodes in my partitioning
-    # true inner nodes? For users yes, but the rest I am not sure. 
-    # Hopefully we have "more" inner nodes than thought
 
     
     raise NotImplementedError
@@ -329,13 +418,6 @@ def init_process(rank, cfg, hydra_output_dir):
         cfg.distributed.backend, rank=rank, world_size=cfg.num_partitions
     )
 
-   
-
-    # dataset: RelBenchDataset = get_dataset(cfg.dataset_name, process=True)
-    # path = os.path.join(os.getcwd(), "data")
-    # databases = dataset.shardDataset(num_shards=cfg.num_partitions, folder=path)
-
-    # TODO
     # 1. Load the partition directly (using rank)
     
     dataset, task, node_dict, local_dict = load_rel_partition(partition_dir=(f"{cfg.partition_dir}/{cfg.dataset_name}"), dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=rank)
@@ -348,10 +430,6 @@ def init_process(rank, cfg, hydra_output_dir):
         ),
         cache_dir=os.path.join(cfg.partition_dir, f"materialized_cache/{rank}"),
     )
-
-    # table_input = get_node_train_table_input(table=task.train_table, task=task)
-    # graph = None
-    # table_input = None
     
     os.makedirs("results/", exist_ok=True)
     os.makedirs(

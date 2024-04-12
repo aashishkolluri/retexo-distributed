@@ -6,7 +6,7 @@ dataset_dir: ../retexo-datasets/
 partition_dir: ./data
 partition_method: "random"
 part_obj: "vol"
-num_partitions: 2
+num_partitions: 4
 num_layers: 2
 channels: 32
 temporal_strategy: "uniform"
@@ -22,7 +22,7 @@ seed: 42
 log_every: 100
 best_val_model: true
 node_rank: 0
-parts_per_node: 4
+parts_per_node: 1
 device: "cuda"
 measure_dv: false
 sleep_time: 0.0
@@ -43,7 +43,7 @@ dataset:
   batching:
     batch_size: ${batch_size}
     shuffle: true
-    num_workers: 4
+    num_workers: 1
 
 model:
   _target_: models.gnn.SimpleGNN
