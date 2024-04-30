@@ -5,7 +5,7 @@ import torch_frame
 from torch import Tensor
 from torch_frame.data.stats import StatType
 from torch_frame.nn.models import ResNet
-from torch_geometric.nn import HeteroConv, LayerNorm, PositionalEncoding
+from torch_geometric.nn import HeteroConv, LayerNorm, PositionalEncoding, SAGEConv
 from models.sage import CustomSAGEConv
 from torch_geometric.typing import EdgeType, NodeType
 from torch_geometric.utils import trim_to_layer
@@ -139,7 +139,7 @@ class HeteroGraphSAGE(torch.nn.Module):
         for _ in range(num_layers):
             conv = HeteroConv(
                 {   # Here replaced in_feats by just channels instead of (channels, channels)
-                    edge_type: CustomSAGEConv(channels , channels, aggregator_type=aggr)
+                    edge_type: SAGEConv((channels, channels), channels, aggr=aggr)
                     for edge_type in edge_types
                 },
                 aggr="sum",

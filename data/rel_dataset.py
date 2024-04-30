@@ -151,10 +151,11 @@ class DistrRelBenchDataset(Dataset):
     def update_part_id(self, df, shards):
         for s in shards:
             df = pd.merge(df , s[['Id', 'part_id']], on='Id', how='left')
-            try:
+            if "part_id_x" in df.columns:
+                inconsistencies = (df['part_id_x'].notna()) & (df['part_id_y'].notna()) & (df['part_id_x'] != df['part_id_y'])
+                assert df[inconsistencies].empty                
                 df['part_id_x'] = df['part_id_x'].fillna(df['part_id_y'])
                 df.rename(columns={'part_id_x': 'part_id'}, inplace=True)
                 df.drop(columns='part_id_y', inplace=True)
-            except:
-                pass
+
         return df

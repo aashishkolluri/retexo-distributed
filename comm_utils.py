@@ -13,6 +13,7 @@ from torch_geometric.data import HeteroData
 import torch.distributed as dist
 import torch
 import torch.nn as nn
+import numpy as np
 
 from torch_frame import stype
 
@@ -67,7 +68,7 @@ def send_and_receive_embeddings(
         node_info_dict[layer_tag][recv_boundary_node_indices] = new_features
 
 def send_and_receive_embeddings_pyg(
-    graph: HeteroData, boundary_node_lists: List[torch.Tensor], node_info_dict: Dict, local_dict: Dict, layer_tag: str
+    graph: HeteroData, boundary_node_lists: List[torch.Tensor], feats_dict: Dict, local_dict: Dict, available: List[torch.Tensor]
 ):
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -77,38 +78,48 @@ def send_and_receive_embeddings_pyg(
         if part_id == rank:
             continue
         
-        for node_type in graph.node_types:
+        for node_type in graph.node_types:    
+            # belong_right = local_dict[node_type].iloc[relevant_indices]["part_id"] == right
+            
+            relevant_indices = graph[node_type]["n_id"].to("cpu")
             boundary_node_t = boundary_node_lists[node_type][part_id]
-            
-            
-            local_mask = torch.isin(torch.tensor(local_dict[node_type]["GlobalId"].to_numpy()), boundary_node_t)
-            features_corr =  graph[node_type]["tf"][local_mask[:graph[node_type]["tf"].num_rows]]
+            # local_mask = torch.isin(torch.tensor(local_dict[node_type].iloc[relevant_indices]["GlobalId"].to_numpy()), boundary_node_t)
+            # boundary_mask = torch.isin(boundary_node_t, torch.tensor(local_dict[node_type].iloc[relevant_indices]["GlobalId"].to_numpy()))
+            local_mask = torch.isin(torch.tensor(local_dict[node_type].iloc[relevant_indices]["GlobalId"].to_numpy()), boundary_node_t)
+            # local_mask = torch.isin(torch.tensor(local_dict[node_type]["GlobalId"].to_numpy()), boundary_node_t)
+            embeddings =  feats_dict[node_type][local_mask[:graph[node_type]["tf"].num_rows]].to("cpu")
+
+            # features_corr =  graph[node_type]["tf"][local_mask[:graph[node_type]["tf"].num_rows]]
             
             # ignoring node types with no embeddings:
-            if stype.embedding not in features_corr.feat_dict:
-                continue
+            # if stype.embedding not in features_corr.feat_dict:
+            #     continue
             
-            embeddings = features_corr.feat_dict[stype.embedding].values
+            # embeddings = features_corr.feat_dict[stype.embedding].values
             # can use features_corr.embeddings.values
+            # embeddings = torch.ones(
+            #     1, device="cuda"
+            # )
             send_req = dist.isend(embeddings, dst=part_id)
-
-
-            recv_mask = torch.isin(torch.tensor(local_dict[node_type]["part_id"].to_numpy()), part_id)
-            # recv_boundary_node_indices = torch.arange(len(local_dict[node_type]["GlobalId"]))[
-            #     local_dict[node_type]["part_id"] == part_id
-            # ]
+            
+            # recv_mask = torch.isin(torch.tensor(local_dict[node_type]["part_id"].to_numpy()), part_id)
+            recv_ids = available[node_type][part_id]
             new_features = torch.zeros(
-                recv_mask.sum().item(),
-                embeddings.shape[1], 
-                device=graph[node_type]["tf"].device,
+                recv_ids.shape[0],
+                feats_dict[node_type].shape[1], 
+                device=embeddings.device
+                # dtype=torch.long
             )
+            
+            # new_features = torch.zeros(1, device="cuda")
             dist.recv(new_features, src=part_id)
             send_req.wait()
             
+            recv_mask = torch.isin(torch.tensor(local_dict[node_type].iloc[relevant_indices]["GlobalId"].to_numpy()), recv_ids)
+            
             # TODO is it enough to just update "values" ??? (what about other attributes of embeddings?)
-            graph[node_type]["tf"][recv_mask[:graph[node_type]["tf"].num_rows]].feat_dict[stype.embedding].values = new_features
-            # node_info_dict[node_type][layer_tag][recv_boundary_node_indices] = new_features
-
+            # feats_dic[node_type]["tf"][recv_mask].feat_dict[stype.embedding].values = new_features
+            feats_dict[node_type][recv_mask[:graph[node_type]["tf"].num_rows]] = new_features.to("cuda")
     
 def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
     """
@@ -153,30 +164,42 @@ def get_boundary_nodes(node_info_dict: Dict, gpb: GraphPartitionBook):
     return boundary
 
 
-def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict):
+def get_boundary_nodes_pyg(graph: HeteroData, task, local_dict: Dict):
     """Get the boundary nodes"""
 
     rank, size = dist.get_rank(), dist.get_world_size()
     device = "cuda"
     
+    num_nodes = {}
+    available = {}
     boundary = {}
     for node_type in graph.node_types:
         boundary[node_type] = [None] * size 
-
+        num_nodes[node_type] = [None] * size 
+        available[node_type] = [None] * size
+        
+    num_task_nodes = { 
+            "train": [None] * size, 
+            "val": [None] * size, 
+            "test": [None] * size
+            }
 
     for i in range(1, size):
         left = (rank - i + size) % size
         right = (rank + i) % size
         
         for node_type in graph.node_types:
-            belong_right = local_dict[node_type]["part_id"] == right
-            ids = torch.tensor(local_dict[node_type]["GlobalId"][belong_right].to_numpy())
+            # only take those in graph
+            relevant_indices = graph[node_type]["n_id"].to("cpu").tolist()
             
-            num_right = torch.tensor(belong_right).sum().view(-1)
+            belong_right = local_dict[node_type].iloc[relevant_indices]["part_id"] == right
+            ids = torch.tensor(local_dict[node_type].iloc[relevant_indices]["GlobalId"][belong_right].to_numpy())
+            
+            num_right = torch.tensor(belong_right.to_numpy()).sum().view(-1)
             if dist.get_backend() == "gloo":
                 num_right = num_right.cpu()
                 num_left = torch.tensor([0])
-            else:
+            else:  
                 num_left = torch.tensor([0], device=device)
             req = dist.isend(num_right, dst=right)
             dist.recv(num_left, src=left)
@@ -192,26 +215,93 @@ def get_boundary_nodes_pyg(graph: HeteroData, node_dict: Dict, local_dict: Dict)
             
             if dist.get_backend() == "gloo":
                 boundary[node_type][left] = u
-            req.wait()
+            # req.wait()
             
-            # node_type = feats.meta["node_types"][j]
-            # belong_right = feats.node_feat_pb[node_type] == right
-            # num_right = belong_right.sum().view(-1)
-            # if dist.get_backend() == "gloo":
-            #     num_right = num_right.cpu()
-            #     num_left = torch.tensor([0])
-            # else:
-            #     num_left = torch.tensor([0], device=device)
-            # req = dist.isend(num_right, dst=right)
-            # dist.recv(num_left, src=left)
-            # feats.partition_idx
-            # node_offset = feats.meta["node_offset"][j]
-            # # v = feats.[node_type][belong_right]
-            # if dist.get_backend() == "gloo":
-            #     v = v.cpu()
-            #     u = torch.zeros(num_left, dtype=torch.long)
+            # Reply the available boundary nodes
+            
+            # mask u with only the available nodes
+            relevant_indices = graph[node_type]["n_id"].to("cpu")
+            masked_u = torch.isin(u, torch.tensor(local_dict[node_type].iloc[relevant_indices]["GlobalId"].to_numpy()))
+            
+            # local_mask = torch.isin(torch.tensor(local_dict[node_type]["GlobalId"][graph[node_type]["n_id"].tolist()].to_numpy()).unique(), u)
+            
+            if dist.get_backend() == "gloo":
+                masked_u = masked_u.cpu()
+                masked_v = torch.zeros(num_right, dtype=torch.bool) # type: ignore
 
-    return boundary
+            req.wait()
+            req = dist.isend(masked_u, dst=left)
+            dist.recv(masked_v, src=right)
+            
+            # reduce u to only the available nodes
+            available_ids = v[masked_v]
+            
+            if dist.get_backend() == "gloo":
+                available[node_type][right] = available_ids
+            
+        
+            # Exchange num of nodes:
+            
+            num_nodes_local = torch.tensor(graph[node_type].num_nodes).cpu()
+            num_nodes_dist =torch.zeros(1, dtype=torch.long)
+            
+            num_nodes[node_type][rank] = num_nodes_local
+            
+            req.wait()
+            req = dist.isend(num_nodes_local, dst=right)
+            dist.recv(num_nodes_dist, src=left)
+            
+            num_nodes[node_type][left] = num_nodes_dist
+        
+        # Exchange num of task nodes:
+        
+        for split, table in [
+            ("train", task.train_table),
+            ("val", task.val_table),
+            ("test", task.test_table),
+        ]:
+            
+            num_task_nodes_local = torch.tensor(table.df.shape[0]).cpu()
+            num_task_nodes_dist =torch.zeros(1, dtype=torch.long)
+            
+            num_task_nodes[split][rank] = num_task_nodes_local
+            
+            req.wait()
+            req = dist.isend(num_task_nodes_local, dst=right)
+            dist.recv(num_task_nodes_dist, src=left)
+            
+            num_task_nodes[split][left] = num_task_nodes_dist
+            
+        req.wait()
+            
+    all_num_nodes = {}
+    all_total_sum = 0
+    all_local_sum = 0
+    for type in graph.node_types:
+        
+        sum = 0
+
+        for i in range(size):
+            sum += num_nodes[type][i].item()
+            all_total_sum += num_nodes[type][i].item()
+  
+        all_local_sum += num_nodes[type][rank].item()
+        
+        all_num_nodes[type] = {"total": sum, "local": num_nodes[type][rank].item()}
+    all_num_nodes["all"] = {"total": all_total_sum, "local": all_local_sum} 
+    
+    train_sum = 0
+    val_sum = 0
+    test_sum = 0
+    for i in range(size):
+        train_sum += num_task_nodes["train"][i].item()
+        val_sum += num_task_nodes["val"][i].item()
+        test_sum += num_task_nodes["test"][i].item()
+        
+    all_task_nodes = {"train": train_sum, "val": val_sum, "test": test_sum}
+    
+
+    return boundary, all_num_nodes, all_task_nodes, available
 
 def aggregate_model(model: nn.Module):
     """Aggregate the model across workers
@@ -316,17 +406,27 @@ class MultiThreadReducerCentralized:
                     self.comm_vol_store.add_cv_grad_reduce_t(cv)
         self._handles.append(self.thread_pool.apply_async(create_stream))
 
-    def aggregate_grad(self, model: nn.Module, num_local_train, num_train):
+    def aggregate_grad(self, model: nn.Module, node_types, all_num_nodes):
         """Aggregate the model across workers using thread pool"""
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         for _, (name, param) in enumerate(model.named_parameters()):
-            param.grad = param.grad * (num_local_train / num_train)
+            if param.grad is None:
+                continue
+            type = extract_node_type(name, node_types)
+            param.grad = param.grad * (all_num_nodes[type]["local"] / all_num_nodes[type]["total"])
             self._reduce(rank, world_size, param, name)
         for handle in self._handles:
             handle.wait()
         self._handles.clear()
         torch.cuda.current_stream().wait_stream(self._stream)
+
+def extract_node_type(name, node_types):
+    tokens = name.split(".")
+    for type in node_types:
+        if type in tokens:
+            return type
+    return "all"
 
 def aggregate_metrics(metrics: Dict):
     """Aggregate the metrics across workers
@@ -343,7 +443,9 @@ def aggregate_metrics(metrics: Dict):
     """
 
     for k, v in metrics.items():
-        dist.all_reduce(v, op=dist.ReduceOp.SUM)
+        t = torch.tensor(v).cuda()
+        dist.all_reduce(t, op=dist.ReduceOp.SUM, async_op=False)
+        metrics[k] = t.item() 
 
     return metrics
 

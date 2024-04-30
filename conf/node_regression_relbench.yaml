@@ -3,7 +3,7 @@
 app: "train" # train, partition_data, partition_relational_data
 dataset_name: "rel-stackex"
 dataset_dir: ../retexo-datasets/
-partition_dir: ./data
+partition_dir: ./data/${dataset_name}/${num_partitions}_partitions
 partition_method: "random"
 part_obj: "vol"
 num_partitions: 4
@@ -12,9 +12,9 @@ channels: 32
 temporal_strategy: "uniform"
 out_channels: 1
 hidden_dim: 256
-num_rounds: [200, 200, 200]
+num_rounds: [10, 10, 10]
 local_epochs: 1
-learning_rate: [0.003, 0.003, 0.003] # TODO: 0.01 in relbench? 
+learning_rate: [0.01, 0.01, 0.01] # TODO: 0.01 in relbench? 
 momentum: 0.9
 weight_decay: 0.0005
 dropout: 0.3
@@ -63,7 +63,7 @@ distributed:
   backend: "gloo"
   init_method: "tcp://"
   master_addr: 127.0.0.1
-  master_port: "10011"
+  master_port: "10014"
 
 task:
   name: "rel-stackex-votes"

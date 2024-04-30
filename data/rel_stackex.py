@@ -13,7 +13,7 @@ import pooch
 from pathlib import Path
 from typing import List, Optional, Tuple, Type, Union
 from data.rel_dataset import DistrRelBenchDataset
-from data.tasks.stackex import VotesTask
+from data.tasks.stackex import VotesTask, EngageTask
 
 
 class DistrStackExDataset(DistrRelBenchDataset):
@@ -24,7 +24,7 @@ class DistrStackExDataset(DistrRelBenchDataset):
     max_eval_time_frames = 1
     
     task_cls_list = [
-        # EngageTask,
+        EngageTask,
         VotesTask,
         # BadgesTask,
         # UserCommentOnPostTask,
@@ -346,8 +346,10 @@ class DistrStackExDataset(DistrRelBenchDataset):
             sorted = uniques.sort_values(by='Id')
             node_dict[shard["name"]] = sorted[['Id', 'part_id']]
             
+            
         # save node dictionary
-        torch.save(node_dict, f"{folder}/{self.name}/node_dict.pt")     
+        torch.save(node_dict, f"{folder}/node_dict.pt")     
+        print("saved the node dict")
         
         # Make a database for each shard
         databases = []
@@ -371,12 +373,13 @@ class DistrStackExDataset(DistrRelBenchDataset):
                 df = db.table_dict[table].df[["GlobalId", "part_id"]]
                 local_to_global_id_dict[table] = df
             
-             
-            torch.save(local_to_global_id_dict, f"{folder}/{self.name}/shard_{i}/local_to_global_id_dict.pt")     
+            if not os.path.exists(f"{folder}/shard_{i}"):
+                os.makedirs(f"{folder}/shard_{i}")
+            torch.save(local_to_global_id_dict, f"{folder}/shard_{i}/local_to_global_id_dict.pt")     
             # test = torch.load(f"{folder}/{self.name}/shard_{i}/local_to_global_id_dict.pt")
             
             # save db to specific folder
-            db.save(f"{folder}/{self.name}/shard_{i}")
+            db.save(f"{folder}/shard_{i}")
             databases.append(db)
             
         return databases

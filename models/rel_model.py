@@ -34,6 +34,7 @@ class RelModel(torch.nn.Module):
         self.chan = channels
         self.out_chan = out_channels
         self.m_norm = norm
+        self.num_layers = num_layers
         
         self.encoder = HeteroEncoder(
             channels=channels,
@@ -91,8 +92,10 @@ class RelModel(torch.nn.Module):
         for node_type, rel_time in rel_time_dict.items():
             x_dict[node_type] = x_dict[node_type] + rel_time
 
-        for node_type, embedding in self.embedding_dict.items():
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+
+        # shallow embeddings. Ignore for now
+        # for node_type, embedding in self.embedding_dict.items():
+        #     x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
             
         x_dict = self.gnn(
             x_dict,
@@ -102,50 +105,51 @@ class RelModel(torch.nn.Module):
         )
         
         output = self.head(x_dict[entity_table][: seed_time.size(0)])        
-        return output
+        x_copy = {key: value.detach() for key, value in x_dict.items()}
+        return output, x_copy
     
-    def get_emebeddings(
-        self,
-        batch: HeteroData,
-        entity_table: NodeType,
-    ) -> Dict[NodeType, Tensor]:
-        seed_time = batch[entity_table].seed_time
-        x_dict = self.encoder(batch.tf_dict)
+    # def get_emebeddings(
+    #     self,
+    #     batch: HeteroData,
+    #     entity_table: NodeType,
+    # ) -> Dict[NodeType, Tensor]:
+    #     seed_time = batch[entity_table].seed_time
+    #     x_dict = self.encoder(batch.tf_dict)
 
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
+    #     rel_time_dict = self.temporal_encoder(
+    #         seed_time, batch.time_dict, batch.batch_dict
+    #     )
         
-        for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
+    #     for node_type, rel_time in rel_time_dict.items():
+    #         x_dict[node_type] = x_dict[node_type] + rel_time
 
-        for node_type, embedding in self.embedding_dict.items():
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
+    #     for node_type, embedding in self.embedding_dict.items():
+    #         x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
          
-        return x_dict
+    #     return x_dict
 
     def get_nth_layer(
         self,
         n: int,
     ):
-        conv, norm = self.gnn.get_nth_layer(n)
         mlp = MLP(
             self.chan,
             out_channels=self.out_chan,
             norm=self.m_norm,
             num_layers=1,
         )
-        
-        # Not needed if we just use get_embeddings first
-        # if n == 0: 
-        #     return FirstLayerRelModel(
-        #         self.temporal_encoder,
-        #         self.encoder,
-        #         conv,
-        #         norm,
-        #         mlp,
-        #         self.embedding_dict
-        #     )
+                
+        if n == 0:
+            return FirstLayerRelModel(
+                self.temporal_encoder,
+                self.encoder,
+                mlp,
+                self.embedding_dict
+            )
+        conv, norm = self.gnn.get_nth_layer(n-1)
+
+        if n == self.num_layers:
+            mlp = self.head
          
         return IntermediateRelModel(conv, norm, mlp)
     
@@ -153,12 +157,10 @@ class RelModel(torch.nn.Module):
 class FirstLayerRelModel(torch.nn.Module):
     """Model with encoders, one convolution layer, and MLP"""
 
-    def __init__(self, temporal_encoder, encoder, conv, norm, mlp, embedding_dict) -> None:
+    def __init__(self, temporal_encoder, encoder, mlp, embedding_dict) -> None:
         super().__init__()
         self.temporal_encoder = temporal_encoder
         self.encoder = encoder
-        self.conv = conv
-        self.norm = norm
         self.mlp = mlp
         self.embedding_dict = embedding_dict
 
@@ -180,16 +182,10 @@ class FirstLayerRelModel(torch.nn.Module):
 
         for node_type, embedding in self.embedding_dict.items():
             x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
-            
-        x_dict = self.conv(
-            x_dict,
-            batch.edge_index_dict,
-            batch.num_sampled_nodes_dict,
-            batch.num_sampled_edges_dict,
-        )
         
-        output = self.mlp(x_dict[entity_table][: seed_time.size(0)])        
-        return output, x_dict
+        output = self.mlp(x_dict[entity_table][: seed_time.size(0)])    
+        x_copy = {key: value.detach() for key, value in x_dict.items()}    
+        return output, x_copy
     
 class IntermediateRelModel(torch.nn.Module):
     """Model with one convolution layer and one MLP layer"""
@@ -202,10 +198,10 @@ class IntermediateRelModel(torch.nn.Module):
 
     def forward(
         self, 
-        entity_table: NodeType,
         seed_time,
         x_dict: Dict[NodeType, Tensor],
         edge_index_dict: Dict[NodeType, Tensor],
+        entity_table: NodeType,
     ) -> torch.Tensor:
         """Forward pass"""
         x_dict = self.conv(x_dict, edge_index_dict)
@@ -213,4 +209,5 @@ class IntermediateRelModel(torch.nn.Module):
         x_dict = {key: x.relu() for key, x in x_dict.items()}
         
         output = self.mlp(x_dict[entity_table][: seed_time.size(0)])  
-        return output, x_dict
+        x_copy = {key: value.detach() for key, value in x_dict.items()}
+        return output, x_copy

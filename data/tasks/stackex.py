@@ -1,6 +1,9 @@
 import duckdb
 import pandas as pd
 
+from contextlib import contextmanager
+import torch.distributed as dist
+
 from relbench.data import Database, RelBenchLinkTask, RelBenchNodeTask, Table
 from relbench.data.task_base import TaskType
 from relbench.metrics import (
@@ -106,6 +109,14 @@ class EngageTask(RelBenchNodeTask):
         )
 
 
+@contextmanager
+def scoped_variables(timestamp_df, votes, posts):
+    try:
+        yield timestamp_df, votes, posts
+    finally:
+        # Clean up resources if needed
+        pass
+
 class VotesTask(RelBenchNodeTask):
     r"""Predict the number of upvotes that an existing question will receive in
     the next 2 years."""
@@ -117,14 +128,61 @@ class VotesTask(RelBenchNodeTask):
     target_col = "popularity"
     timedelta = pd.Timedelta(days=365 * 2)
     metrics = [mae, rmse]
-
-
     
-    def make_table(self, db: Database, timestamps: "pd.Series[pd.Timestamp]", rank: int) -> Table:
+    def make_table(self, db: Database, timestamps: "pd.Series[pd.Timestamp]") -> Table:
+        def execute_query(timestamp_df, votes, posts):
+            df = duckdb.sql(
+                f"""
+                SELECT
+                    t.timestamp,
+                    p.id AS PostId,
+                    COUNT(distinct v.id) AS popularity
+                FROM
+                    timestamp_df t
+                LEFT JOIN
+                    posts p
+                ON
+                    p.CreationDate <= t.timestamp AND
+                    p.owneruserid != -1 AND
+                    p.owneruserid is not null AND
+                    p.PostTypeId = 1
+                LEFT JOIN
+                    votes v
+                ON
+                    p.id = v.PostId AND
+                    v.CreationDate > t.timestamp AND
+                    v.CreationDate <= t.timestamp + INTERVAL '{self.timedelta}' AND
+                    v.votetypeid = 2
+                GROUP BY
+                    t.timestamp,
+                    p.id
+                """
+            ).df()
+            return df
+
+        with scoped_variables(pd.DataFrame({"timestamp": timestamps}), db.table_dict["votes"].df, db.table_dict["posts"].df) as (timestamp_df, votes, posts):
+            df = execute_query(timestamp_df, votes, posts)
+            return Table(
+                df=df,
+                fkey_col_to_pkey_table={self.entity_col: self.entity_table},
+                pkey_col=None,
+                time_col=self.time_col,
+            )
+            
         timestamp_df = pd.DataFrame({"timestamp": timestamps})
         votes = db.table_dict["votes"].df
         posts = db.table_dict["posts"].df
 
+        # rank, size = dist.get_rank(), dist.get_world_size()
+        
+        # # frames = [{} for _ in range(size)]
+        # frames = [{} for _ in range(size)]
+        # frames[rank] = {
+        #     "timestamp_df": pd.DataFrame({"timestamp": timestamps}),
+        #     "votes": db.table_dict["votes"].df,
+        #     "posts": db.table_dict["posts"].df,
+        # }
+        
         df = duckdb.sql(
             f"""
             SELECT
@@ -132,16 +190,16 @@ class VotesTask(RelBenchNodeTask):
                 p.id AS PostId,
                 COUNT(distinct v.id) AS popularity
             FROM
-                timestamp_df t
+                frames[rank]["timestamp_df"] t
             LEFT JOIN
-                posts p
+                frames[rank]["posts"] p
             ON
                 p.CreationDate <= t.timestamp AND
                 p.owneruserid != -1 AND
                 p.owneruserid is not null AND
                 p.PostTypeId = 1
             LEFT JOIN
-                votes v
+                frames[rank]["votes"] v
             ON
                 p.id = v.PostId AND
                 v.CreationDate > t.timestamp AND

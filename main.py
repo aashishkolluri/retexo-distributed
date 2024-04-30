@@ -22,11 +22,13 @@ def main(cfg: DictConfig) -> None:
 
     # load_rel_partition(partition_dir=(f"{cfg.partition_dir}/{cfg.dataset_name}"), dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=3)
     # rel_graph_partition(
-    #     cfg.dataset_name, "data", cfg.num_partitions, cfg
-    #     )  
+        # "mind", f"{cfg.partition_dir}/{cfg.dataset_name}", cfg.num_partitions, cfg
+        # )  
 
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
+    
+    
 
     if cfg.app == "partition_data":
         graph, _, _ = load_data(**cfg.dataset.download)
@@ -34,12 +36,13 @@ def main(cfg: DictConfig) -> None:
         return
     elif cfg.app == "partition_relational_data":
         rel_graph_partition(
-            cfg.dataset_name, "data", cfg.num_partitions, cfg
+            cfg.dataset_name, cfg.partition_dir, cfg.num_partitions, cfg
          )   
         return
     elif cfg.app == "train":
         train = trainers.rel_trainer # TODO change depending on cfg
         # train = trainers.trainer
+        
         # set up the distributed training environment
         if cfg.distributed.backend == "gloo":
             n_devices = torch.cuda.device_count()
