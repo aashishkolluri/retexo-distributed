@@ -8,13 +8,14 @@ import torch
 import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
-from data.dataset import load_data, graph_partition, rel_graph_partition, load_rel_partition
+from data.dataset import load_data, graph_partition, rel_graph_partition, load_partition, load_user_item_data
 import trainers.trainer
 import trainers.rel_trainer
+import trainers.user_item_trainer
 
 # logging.basicConfig(level = logging.INFO)
 
-@hydra.main(config_path="conf", config_name="node_regression_relbench", version_base=None)
+@hydra.main(config_path="conf", config_name="movie_lens", version_base=None)
 def main(cfg: DictConfig) -> None:
     """Run the specified application"""
 
@@ -28,17 +29,38 @@ def main(cfg: DictConfig) -> None:
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
     
-    
 
     if cfg.app == "partition_data":
         graph, _, _ = load_data(**cfg.dataset.download)
         graph_partition(graph, **cfg.dataset.partition)
+        load_partition(cfg.dataset.partition.partition_dir, cfg.dataset.partition.dataset_name, 0)
         return
     elif cfg.app == "partition_relational_data":
         rel_graph_partition(
             cfg.dataset_name, cfg.partition_dir, cfg.num_partitions, cfg
          )   
         return
+    elif cfg.app == "partition_user_item_data":
+        graph, itemList = load_user_item_data(**cfg.dataset.download)
+        graph_partition(graph, **cfg.dataset.partition)
+        temp = load_partition(cfg.dataset.partition.partition_dir, cfg.dataset.partition.dataset_name, 0, task="edge_prediction")
+        return
+    elif cfg.app == "centralized_pinsage":
+        train = trainers.user_item_trainer
+        if cfg.distributed.backend == "gloo":
+            n_devices = torch.cuda.device_count()
+            devices = [f"{i}" for i in range(n_devices)]
+
+            if "CUDA_VISIBLE_DEVICES" in os.environ:
+                devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+                n_devices = len(devices)
+                
+            torch.multiprocessing.set_start_method('spawn')
+            os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
+            p = mp.Process(target=train.init_process, args=(0, cfg, hydra_output_dir))
+            p.start()
+            p.join()
+        
     elif cfg.app == "train":
         train = trainers.rel_trainer # TODO change depending on cfg
         # train = trainers.trainer

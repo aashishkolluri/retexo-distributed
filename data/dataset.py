@@ -3,10 +3,14 @@
 import logging
 import os
 import json
+import re
+
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from data.rel_dataset import DistrRelBenchDataset
 from data.rel_stackex import DistrStackExDataset
+from data.movielens_utils import PandasGraphBuilder, train_test_split_by_time, build_train_graph, build_val_test_matrix
+
 from relbench.data import NodeTask, RelBenchDataset
 from data.mind import DistrMindDataset
 import dgl # type: ignore
@@ -17,19 +21,13 @@ import torch
 from torch_geometric.datasets import FacebookPagePage, Planetoid, LastFMAsia # type: ignore
 from torch_geometric.utils.convert import to_dgl # type: ignore
 from sklearn.preprocessing import StandardScaler # type: ignore
-from torch_geometric.data import HeteroData
-from relbench.data.database import Database
-from relbench.data.table import Table
-from torch_geometric.distributed.partition import Partitioner
-from torch_geometric.distributed.local_feature_store import LocalFeatureStore
-from torch_geometric.distributed.local_graph_store import LocalGraphStore
+
+import pandas as pd
 
 
-from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph, NodeTrainTableInput
-from text_embedder import GloveTextEmbedding 
+from relbench.external.graph import get_node_train_table_input, make_pkey_fkey_graph
 from inferred_stypes import dataset2inferred_stypes
 from omegaconf import DictConfig
-from torch_frame.config.text_embedder import TextEmbedderConfig
 
 
 
@@ -53,6 +51,144 @@ def load_ogb_dataset(name, data_path):
     node_data["test_mask"][split_idx["test"]] = True
     return g
 
+def load_movielens_dataset(name, data_path):
+    """Load movieLens dataset into DGLGraph"""
+    ## Build heterogeneous graph
+    # Load data
+    users = []
+    with open(os.path.join(data_path, "users.dat"), encoding="latin1") as f:
+        for l in f:
+            id_, gender, age, occupation, zip_ = l.strip().split("::")
+            users.append(
+                {
+                    "user_id": int(id_),
+                    "gender": gender,
+                    "age": age,
+                    "occupation": occupation,
+                    "zip": zip_,
+                }
+            )
+    users = pd.DataFrame(users).astype("category")
+
+    movies = []
+    with open(os.path.join(data_path, "movies.dat"), encoding="latin1") as f:
+        for l in f:
+            id_, title, genres = l.strip().split("::")
+            genres_set = set(genres.split("|"))
+
+            # extract year
+            assert re.match(r".*\([0-9]{4}\)$", title)
+            year = title[-5:-1]
+            title = title[:-6].strip()
+
+            data = {"movie_id": int(id_), "title": title, "year": year}
+            for g in genres_set:
+                data[g] = True
+            movies.append(data)
+    movies = pd.DataFrame(movies).astype({"year": "category"})
+
+    ratings = []
+    with open(os.path.join(data_path, "ratings.dat"), encoding="latin1") as f:
+        for l in f:
+            user_id, movie_id, rating, timestamp = [
+                int(_) for _ in l.split("::")
+            ]
+            ratings.append(
+                {
+                    "user_id": user_id,
+                    "movie_id": movie_id,
+                    "rating": rating,
+                    "timestamp": timestamp,
+                }
+            )
+    ratings = pd.DataFrame(ratings)
+
+    # Filter the users and items that never appear in the rating table.
+    distinct_users_in_ratings = ratings["user_id"].unique()
+    distinct_movies_in_ratings = ratings["movie_id"].unique()
+    users = users[users["user_id"].isin(distinct_users_in_ratings)]
+    movies = movies[movies["movie_id"].isin(distinct_movies_in_ratings)]
+
+    # Group the movie features into genres (a vector), year (a category), title (a string)
+    genre_columns = movies.columns.drop(["movie_id", "title", "year"])
+    movies[genre_columns] = movies[genre_columns].fillna(False).astype("bool")
+    movies_categorical = movies.drop("title", axis=1)
+
+    # Build graph
+    graph_builder = PandasGraphBuilder()
+    graph_builder.add_entities(users, "user_id", "user")
+    graph_builder.add_entities(movies_categorical, "movie_id", "movie")
+    graph_builder.add_binary_relations(
+        ratings, "user_id", "movie_id", "watched"
+    )
+    graph_builder.add_binary_relations(
+        ratings, "movie_id", "user_id", "watched-by"
+    )
+
+    g = graph_builder.build()
+
+    # Assign features.
+    # Note that variable-sized features such as texts or images are handled elsewhere.
+    for data_type in ["gender", "age", "occupation", "zip"]:
+        g.nodes["user"].data[data_type] = torch.LongTensor(
+            np.array(users[data_type].cat.codes.values)
+        )
+
+    g.nodes["movie"].data["year"] = torch.LongTensor(
+        np.array(movies["year"].cat.codes.values)
+    )
+    g.nodes["movie"].data["genre"] = torch.FloatTensor(
+        np.array(movies[genre_columns].values)
+    )
+    
+    ## Build title set
+    movie_textual_dataset = {"title": movies["title"].values}
+
+
+    for edge_type in ["watched", "watched-by"]:
+        for data_type in ["rating", "timestamp"]:
+            g.edges[edge_type].data[data_type] = torch.LongTensor(
+                np.array(ratings[data_type].values)
+            )
+            
+    # This is a little bit tricky as we want to select the last interaction for test, and the
+    # second-to-last interaction for validation.
+    train_indices, val_indices, test_indices = train_test_split_by_time(
+        ratings, "timestamp", "user_id"
+    )
+    
+    # for edge_type in ["watched", "watched-by"]:
+    #     g.edges[edge_type].data["train_mask"] = torch.BoolTensor(train_mask)
+    #     g.edges[edge_type].data["val_mask"] = torch.BoolTensor(val_mask)
+    #     g.edges[edge_type].data["test_mask"] = torch.BoolTensor(test_mask)
+
+    # Build the graph with training interactions only.
+    train_g = build_train_graph(
+        g, train_indices, "user", "movie", "watched", "watched-by"
+    )
+    assert train_g.out_degrees(etype="watched").min() > 0
+
+    # Build the user-item sparse matrix for validation and test set.
+    # val_indices = val_mask.to_numpy().nonzero()[0]
+    # test_indices = test_mask.to_numpy().nonzero()[0]
+    val_matrix, test_matrix = build_val_test_matrix(
+        g, val_indices, test_indices, "user", "movie", "watched"
+    )
+    
+    dataset = {
+        "train-graph": train_g,
+        "val-matrix": val_matrix,
+        "test-matrix": test_matrix,
+        "item-texts": movie_textual_dataset,
+        "item-images": None,
+        "user-type": "user",
+        "item-type": "movie",
+        "user-to-item-type": "watched",
+        "item-to-user-type": "watched-by",
+        "timestamp-edge-column": "timestamp",
+    }
+    
+    return g, dataset, train_g
 
 def load_data(dataset_name: str, dataset_dir: str, add_self_loop=False) -> Tuple[dgl.DGLGraph, int, int]:
     """Load dataset
@@ -196,6 +332,18 @@ def load_data(dataset_name: str, dataset_dir: str, add_self_loop=False) -> Tuple
 
     return graph, n_feat, n_class
 
+def load_user_item_data(dataset_name: str, dataset_dir: str) -> Tuple[dgl.DGLGraph, Dict, dgl.DGLGraph]:
+    if dataset_name == "movielens":
+        # dataset = MovieLensDataset(name="ml-1m", valid_ratio=0.1, test_ratio=0.2, raw_dir=dataset_dir)
+        # graph = dataset[0]
+        graph, dataset, train_graph = load_movielens_dataset(name="movielens", data_path=dataset_dir)
+        user_item_edge = "user-movie"
+    else:
+        raise ValueError(f"Dataset {dataset_name} is not supported")
+
+
+    return graph, dataset, train_graph
+
 
 def get_masks_fb_page(dataset, te_tr_split=0.2, val_tr_split=0.2):
     """Get train, test and validation masks for Facebook Page dataset"""
@@ -242,7 +390,7 @@ def graph_partition(
     dataset_name: str,
     partition_dir: str,
     num_parts: int,
-    part_method: Optional[str] = "random",
+    part_method: Optional[str] = "metis",
     part_obj: Optional[str] = "vol",
 ) -> None:
     """Partition the graph
@@ -273,8 +421,8 @@ def graph_partition(
 
     if not os.path.exists(partition_config):
         with graph.local_scope():
-            graph.ndata["in_deg"] = graph.in_degrees()
-            graph.ndata["out_deg"] = graph.out_degrees()
+            # graph.ndata["in_deg"] = graph.in_degrees()
+            # graph.ndata["out_deg"] = graph.out_degrees()
             partition_graph(
                 graph,
                 dataset_name,
@@ -284,31 +432,34 @@ def graph_partition(
                 objtype=part_obj,
             )
 
-    # number of features and classes
-    n_feat = graph.ndata["feat"].shape[1]  # pylint: disable=no-member
-    n_class = -1
-    if graph.ndata["label"].dim() == 1:  # pylint: disable=no-member
-        n_class = graph.ndata["label"].max().item() + 1  # pylint: disable=no-member
+    if graph.is_homogeneous: 
+        # number of features and classes
+        n_feat = graph.ndata["feat"].shape[1]  # pylint: disable=no-member
+        n_class = -1
+        if graph.ndata["label"].dim() == 1:  # pylint: disable=no-member
+            n_class = graph.ndata["label"].max().item() + 1  # pylint: disable=no-member
+        else:
+            n_class = graph.ndata["label"].shape[1]  # pylint: disable=no-member
+
+        n_train = graph.ndata["train_mask"].int().sum().item()  # pylint: disable=no-member
+        n_val = graph.ndata["val_mask"].int().sum().item()  # pylint: disable=no-member
+        n_test = graph.ndata["test_mask"].int().sum().item()  # pylint: disable=no-member
+
+        with open(
+            os.path.join(partition_graph_dir, "meta.json"), "w", encoding="utf-8"
+        ) as f_ptr:
+            json.dump(
+                {
+                    "n_feat": n_feat,
+                    "n_class": n_class,
+                    "n_train": n_train,
+                    "n_val": n_val,
+                    "n_test": n_test,
+                },
+                f_ptr,
+            )
     else:
-        n_class = graph.ndata["label"].shape[1]  # pylint: disable=no-member
-
-    n_train = graph.ndata["train_mask"].int().sum().item()  # pylint: disable=no-member
-    n_val = graph.ndata["val_mask"].int().sum().item()  # pylint: disable=no-member
-    n_test = graph.ndata["test_mask"].int().sum().item()  # pylint: disable=no-member
-
-    with open(
-        os.path.join(partition_graph_dir, "meta.json"), "w", encoding="utf-8"
-    ) as f_ptr:
-        json.dump(
-            {
-                "n_feat": n_feat,
-                "n_class": n_class,
-                "n_train": n_train,
-                "n_val": n_val,
-                "n_test": n_test,
-            },
-            f_ptr,
-        )
+        print("TODO")
         
         
 def rel_graph_partition(
@@ -359,8 +510,9 @@ def load_rel_partition(
     return dataset, task, node_dict, local_dict
 
 def load_partition(
-    partition_dir: str, dataset_name: str, part_id: int
-) -> Tuple[dgl.DGLGraph, Dict, int, int, int, int, int, GraphPartitionBook]:
+    partition_dir: str, dataset_name: str, part_id: int, task: str = "classification"
+):
+# ) -> Tuple[dgl.DGLGraph, Dict, int, int, int, int, int, GraphPartitionBook]:
     """Load partitioned graph
 
     Parameters
@@ -388,11 +540,11 @@ def load_partition(
     (
         sub_graph,
         node_feat,
-        _,
+        edge_feat,
         graph_partition_book,
         _,
         node_type,
-        _,
+        edge_type,
     ) = dgl.distributed.load_partition(partition_config, part_id)
     node_type = node_type[0]
     node_feat[dgl.NID] = sub_graph.ndata[dgl.NID]
@@ -400,44 +552,83 @@ def load_partition(
         node_feat["part_id"] = sub_graph.ndata["part_id"]
 
     node_feat["inner_node"] = sub_graph.ndata["inner_node"].bool()
-    node_feat["label"] = node_feat[node_type + "/label"]
-    node_feat["feat"] = node_feat[node_type + "/feat"]
-    node_feat["in_deg"] = node_feat[node_type + "/in_deg"]
-    node_feat["out_deg"] = node_feat[node_type + "/out_deg"]
-    node_feat["train_mask"] = node_feat[node_type + "/train_mask"].bool()
-    node_feat.pop(node_type + "/label")
-    node_feat.pop(node_type + "/feat")
-    node_feat.pop(node_type + "/in_deg")
-    node_feat.pop(node_type + "/out_deg")
-    node_feat.pop(node_type + "/train_mask")
+    if graph_partition_book.is_homogeneous:
+        node_feat["label"] = node_feat[node_type + "/label"]
+        node_feat["feat"] = node_feat[node_type + "/feat"]
+        node_feat["in_deg"] = node_feat[node_type + "/in_deg"]
+        node_feat["out_deg"] = node_feat[node_type + "/out_deg"]
+        node_feat["train_mask"] = node_feat[node_type + "/train_mask"].bool()
+        node_feat.pop(node_type + "/label")
+        node_feat.pop(node_type + "/feat")
+        node_feat.pop(node_type + "/in_deg")
+        node_feat.pop(node_type + "/out_deg")
+        node_feat.pop(node_type + "/train_mask")
 
-    node_feat["val_mask"] = node_feat[node_type + "/val_mask"].bool()
-    node_feat["test_mask"] = node_feat[node_type + "/test_mask"].bool()
-    node_feat.pop(node_type + "/val_mask")
-    node_feat.pop(node_type + "/test_mask")
+        node_feat["val_mask"] = node_feat[node_type + "/val_mask"].bool()
+        node_feat["test_mask"] = node_feat[node_type + "/test_mask"].bool()
+        node_feat.pop(node_type + "/val_mask")
+        node_feat.pop(node_type + "/test_mask")
 
-    sub_graph.ndata.clear()
-    sub_graph.edata.clear()
+        sub_graph.ndata.clear()
+        sub_graph.edata.clear()
 
-    with open(
-        os.path.join(partition_graph_dir, "meta.json"), "r", encoding="utf-8"
-    ) as f_ptr:
-        partition_meta = json.load(f_ptr)
+        with open(
+            os.path.join(partition_graph_dir, "meta.json"), "r", encoding="utf-8"
+        ) as f_ptr:
+            partition_meta = json.load(f_ptr)
 
-    n_feat = partition_meta["n_feat"]
-    n_class = partition_meta["n_class"]
-    n_train = partition_meta["n_train"]
-    n_val = partition_meta["n_val"]
-    n_test = partition_meta["n_test"]
+        n_feat = partition_meta["n_feat"]
+        n_class = partition_meta["n_class"]
+        n_train = partition_meta["n_train"]
+        n_val = partition_meta["n_val"]
+        n_test = partition_meta["n_test"]
+    else:
+        print("TODO")
+        n_feat = 0
+        n_class = 0
+        n_train = torch.tensor(0)
+        n_val = torch.tensor(0)
+        n_test = torch.tensor(0)
+        
+        
+    if task == "classification":
+        return (
+            sub_graph,
+            node_feat,
+            n_feat,
+            n_class,
+            n_train,
+            n_val,
+            n_test,
+            graph_partition_book,
+        )
+    elif task == "edge_prediction":   
+        
+        # sub_graph
+        # # train_g = build_train_graph(
+        # #     g, node_feat, train_indices, "user", "movie", "watched", "watched-by"
+        # # )
+        # assert train_g.out_degrees(etype="watched").min() > 0
 
-    return (
-        sub_graph,
-        node_feat,
-        n_feat,
-        n_class,
-        n_train,
-        n_val,
-        n_test,
-        graph_partition_book,
-    )
+        # Build the user-item sparse matrix for validation and test set.
+        
+        val_indices = edge_feat["user:watched:movie/val_mask"].nonzero(as_tuple=True)[0]
+        test_indices = edge_feat["user:watched:movie/test_mask"].nonzero(as_tuple=True)[0]
+        # n_user, n_movie = 10, 10
+        
+        n_user = node_feat["user/gender"].shape[0]
+        n_movie = node_feat["movie/year"].shape[0]
+        val_matrix, test_matrix = build_val_test_matrix(
+            sub_graph, graph_partition_book, val_indices, test_indices, n_user, n_movie, "watched"
+        )
+        
+        return (
+            sub_graph,
+            node_feat,
+            edge_feat,
+            n_feat,
+            "user",
+            "movie",
+            graph_partition_book,
+        )
 

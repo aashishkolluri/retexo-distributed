@@ -1,2 +1,4 @@
 /outputs/
 /results/
+/data/rel-stackex/
+__pycache__/
