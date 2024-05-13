@@ -58,12 +58,17 @@ class FirstLayerModel(torch.nn.Module):
         # scorer
         pos_score = self.scorer(pos_graph, h_item)
         neg_score = self.scorer(neg_graph, h_item)
-        return (neg_score - pos_score + 1).clamp(min=0), h_item, h_item_dst
+        
+        h_item_copy = h_item.detach()
+        h_item_dst_copy = h_item.detach()
+        
+        return (neg_score - pos_score + 1).clamp(min=0), h_item_copy, h_item_dst_copy
     
     def get_repr(self, blocks):
         h_item = self.proj(blocks[0].srcdata)
         h_item_dst = self.proj(blocks[-1].dstdata)
-        return h_item_dst + h_item
+        
+        return h_item_dst + h_item, h_item, h_item_dst
     
 class IntermediateModel(torch.nn.Module):
     def __init__(self, sage, scorer) -> None:
@@ -77,5 +82,15 @@ class IntermediateModel(torch.nn.Module):
         # scorer
         pos_score = self.scorer(pos_graph, h_item)
         neg_score = self.scorer(neg_graph, h_item)
-        return (neg_score - pos_score + 1).clamp(min=0)
+        
+        h_item_copy = h_item.detach()
+        return (neg_score - pos_score + 1).clamp(min=0), h_item_copy
+    
+    def get_repr(self, blocks, h_item, h_item_dst):
+        # h_item = self.proj(blocks[0].srcdata)
+        # h_item_dst = self.proj(blocks[-1].dstdata)
+        next_item = self.sage(blocks, h_item)
+        next_item_copy = next_item.detach()
+        return h_item_dst + next_item
+    
     

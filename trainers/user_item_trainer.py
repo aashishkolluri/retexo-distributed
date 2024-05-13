@@ -370,7 +370,7 @@ def train(
         pos_graph = pos_graph.to(device)
         neg_graph = neg_graph.to(device)
 
-        loss, h_item, h_item_dst = curr_model(pos_graph, neg_graph, train_blocks)
+        loss, train_h_item, train_h_item_dst = curr_model(pos_graph, neg_graph, train_blocks)
         loss = loss.mean()
         opt.zero_grad()
         loss.backward()
@@ -381,11 +381,12 @@ def train(
         with torch.no_grad():
             item_batches = torch.arange(train_graph.num_nodes(item_ntype))
             h_item_batches = []
-            h_item_batches.append(curr_model.get_repr(test_blocks))
-            h_item = torch.cat(h_item_batches, 0)
+            repr, val_h_item, val_h_item_dst = curr_model.get_repr(test_blocks)
+            h_item_batches.append(repr)
+            h_items = torch.cat(h_item_batches, 0)
 
             print(
-                evaluation.evaluate_nn(dataset, h_item, 10, train_graph.num_nodes(item_ntype))
+                evaluation.evaluate_nn(dataset, h_items, 10, train_graph.num_nodes(item_ntype))
             )
     
     # reminaings
@@ -394,12 +395,18 @@ def train(
         curr_model = setup_model(model, i, cfg.device)
         sync_model(curr_model)
         
-        opt = torch.optim.Adam(model.parameters(), lr=3e-5)
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[i])
         
         for i in range(cfg.num_rounds[0]):
             curr_model.train()
 
-            loss = curr_model(pos_graph, neg_graph, blocks).mean()
+            # TODO copy / detach graph?
+            
+            for i in range(len(train_blocks)):
+                train_blocks[i] = train_blocks[i].detach()
+            
+            loss, train_h_item, train_h_item_dst = curr_model(pos_graph, neg_graph, train_h_item, train_h_item_dst, train_blocks)
+            loss = loss.mean()
             
             opt.zero_grad()
             loss.backward()
@@ -410,15 +417,15 @@ def train(
             with torch.no_grad():
                 item_batches = torch.arange(train_graph.num_nodes(item_ntype))
                 h_item_batches = []
-                for blocks in dataloader_test:
-                    for i in range(len(blocks)):
-                        blocks[i] = blocks[i].to(device)
+                for i in range(len(test_blocks)):
+                    test_blocks[i] = test_blocks[i].detach()
 
-                    h_item_batches.append(curr_model.get_repr(blocks))
-                h_item = torch.cat(h_item_batches, 0)
+                repr, val_h_item, val_h_item_dst = curr_model.get_repr(test_blocks, val_h_item, val_h_item_dst)
+                h_item_batches.append(repr)
+                h_items = torch.cat(h_item_batches, 0)
 
                 print(
-                    evaluation.evaluate_nn(dataset, h_item, 10, train_graph.num_nodes(item_ntype))
+                    evaluation.evaluate_nn(dataset, h_items, 10, train_graph.num_nodes(item_ntype))
                 )
     
     # if rank == 0:
