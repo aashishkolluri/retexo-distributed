@@ -50,22 +50,6 @@ def set_torch_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def get_in_out_graph(
-    graph: dgl.DGLGraph, node_dict: Dict
-) -> Tuple[dgl.DGLGraph, dgl.DGLGraph]:
-    """Get the in and out graph"""
-    in_graph = dgl.node_subgraph(graph, node_dict["inner_node"].bool())
-    in_graph.ndata.clear()
-    in_graph.edata.clear()
-
-    out_graph = graph.clone()
-    out_graph.ndata.clear()
-    out_graph.edata.clear()
-    in_nodes = torch.arange(in_graph.num_nodes())
-    out_graph.remove_edges(out_graph.out_edges(in_nodes, form="eid"))
-    return in_graph, out_graph
-
-
 def setup_model(entire_model, curr_layer, device):
     """Set up the model"""
     # train the nth layer of the model
@@ -74,179 +58,6 @@ def setup_model(entire_model, curr_layer, device):
         curr_model = curr_model.cuda()
     return curr_model
 
-
-def get_scheduler(num_rounds, optimizer):
-    """Get the scheduler for learning rate"""
-
-    def lr_lambda(current_step: int):
-        if current_step < 0:
-            return float(current_step) / float(max(1, 0))
-        return max(
-            0.0,
-            float(num_rounds - current_step) / float(max(1, num_rounds - 0)),
-        )
-
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    return scheduler
-
-
-
-def train_for_one_layer(
-    curr_model,
-    traindata,
-    valdata,
-    testdata,
-    optimizer,
-    metrics,
-    loss_function,
-    cfg,
-    worker_trainer,
-    num_tr_val_te,
-    num_local_tr_val_te,
-    num_rounds,
-    perf_store,
-    results_dir,
-):
-    """Training loop for one layer"""
-    num_train, num_val, num_test = num_tr_val_te
-    num_local_train, num_local_val, num_local_test = num_local_tr_val_te
-    if cfg.device == "cuda":
-        traindata = [data.to(torch.device("cuda")) for data in traindata]
-        valdata = [data.to(torch.device("cuda")) for data in valdata]
-        testdata = [data.to(torch.device("cuda")) for data in testdata]
-
-    rank = dist.get_rank()
-
-    if rank == 0:
-        best_params = curr_model.state_dict()
-        best_val_loss = float("inf")
-        best_val_acc = 0.0
-        best_test_acc = 0.0
-        best_val_metrics = None
-        best_epoch = 0
-
-    reducer = MultiThreadReducerCentralized(
-        curr_model, cfg.sleep_time, comm_volume_perf_store, cfg.measure_dv
-    )
-
-    # start training
-    for training_round in range(num_rounds):
-        # start the round
-        start_time = time.time()
-        # train the model
-        worker_trainer.train_model(
-            curr_model,
-            traindata,
-            optimizer,
-            loss_function,
-            cfg.local_epochs,
-        )
-        time_round = time.time() - start_time
-        perf_store.add_local_train_time(time_round)
-
-        agg_time_s = time.time()
-        with torch.no_grad():
-            reducer.aggregate_grad(curr_model, num_local_train, num_train)
-        agg_time = time.time() - agg_time_s
-        perf_store.add_grad_reduce_time(agg_time)
-
-        optimizer.step()
-
-        if cfg.best_val_model:
-            val_metrics = worker_trainer.evaluate(
-                curr_model, valdata, metrics, loss_function
-            )
-            # sync the val metrics
-            for k, v in val_metrics.items():
-                val_metrics[k] = v * (num_local_val / num_val)
-            aggregate_metrics(val_metrics)
-
-            if rank == 0:
-                # store the model with best val accuracy
-                if val_metrics["accuracy"] > best_val_acc:
-                    best_val_loss = val_metrics["loss"]
-                    best_val_metrics = val_metrics
-                    best_val_acc = val_metrics["accuracy"]
-                    best_params = copy.deepcopy(curr_model.state_dict())
-                    best_epoch = training_round
-
-        if (
-            training_round + 1
-        ) % cfg.log_every == 0 or training_round == num_rounds - 1:
-            # evaluate the model
-            train_metrics = worker_trainer.evaluate(
-                curr_model, traindata, metrics, loss_function
-            )
-            val_metrics = worker_trainer.evaluate(
-                curr_model, valdata, metrics, loss_function
-            )
-            test_metrics = worker_trainer.evaluate(
-                curr_model, testdata, metrics, loss_function
-            )
-            # aggregate the test metrics
-            for k, v in test_metrics.items():
-                test_metrics[k] = v * (num_local_test / num_test)
-            aggregate_metrics(test_metrics)
-
-            if rank == 0:
-                if test_metrics["accuracy"] > best_test_acc:
-                    best_test_acc = test_metrics["accuracy"]
-
-            print(
-                f"Rank {rank:2} | Training Round {training_round:2} | compute {time_round:2.4f} s | reduce {agg_time:2.4f} s"
-            )
-
-            with open(results_dir + "accuracy.txt", "a+") as f:
-                f.write(
-                    f'Epoch {training_round}, {val_metrics["accuracy"].item()}, {test_metrics["accuracy"].item()}\n'
-                )
-            # log the metrics
-            print_str = f"Rank {rank:2} | Train"
-            for k, v in train_metrics.items():
-                print_str += f" | {k}: {v:2.4f}"
-            print(print_str)
-            print_str = f"Rank {rank:2} | Val  "
-            for k, v in val_metrics.items():
-                print_str += f" | {k}: {v:2.4f}"
-            print(print_str)
-            print_str = f"Rank {rank:2} | Test "
-            for k, v in test_metrics.items():
-                print_str += f" | {k}: {v:2.4f}"
-            print(print_str)
-
-    if cfg.best_val_model:
-        if rank == 0:
-            curr_model.load_state_dict(best_params)
-        sync_model(curr_model)
-
-        test_metrics = worker_trainer.evaluate(
-            curr_model, testdata, metrics, loss_function
-        )
-        for k, v in test_metrics.items():
-            test_metrics[k] = v * (num_local_test / num_test)
-        aggregate_metrics(test_metrics)
-
-        if rank == 0:
-            print(f"Best model at epoch {best_epoch} | loss {best_val_loss:5.4f}")
-            print(f"Best model val metrics: {best_val_metrics}")
-            print(f"Best model test metrics: {test_metrics}")
-            print(f"Best test accuracy achieved: {best_test_acc}")
-            print("-------------------------------------------" * 3)
-            with open(results_dir + "best_stats.txt", "a+") as f:
-                f.write(
-                    f'Epoch {best_epoch}, {best_val_metrics["accuracy"].item()}, {test_metrics["accuracy"].item()}, {best_test_acc}\n'
-                )
-
-    time.sleep(5) # for printing purposes
-
-def construct_graph_and_features_to_compute_next_embedding(
-    emb_data_dict, task, graph, node_dict, prev_feat_tag, inner_node_indices
-):
-    """Construct the graph and features for the next layer parallel to training"""
-    prev_feats = node_dict[prev_feat_tag]
-    graph.ndata["feat"] = prev_feats
-    emb_data = task.construct_graph_and_features(graph, inner_node_indices)
-    emb_data_dict["emb_data"] = emb_data
 
 def train(
     graph: dgl.DGLGraph,
@@ -345,7 +156,7 @@ def train(
     # Model
     num_layers = cfg.num_layers
     model = PinSAGEModel(
-        train_graph, item_ntype, textset, 16, num_layers
+        train_graph, item_ntype, textset, cfg.hidden_dim, num_layers
     ).to(device)
     
     # Optimizer
@@ -363,6 +174,8 @@ def train(
     for i in range(len(test_blocks)):
         test_blocks[i] = test_blocks[i].to(device)
         
+        
+    print("Starting training... Layer 0")
     for i in range(cfg.num_rounds[0]):
         curr_model.train()
         # Copy to GPU
@@ -392,20 +205,18 @@ def train(
     # reminaings
     
     for i in range(1, num_layers + 1):
+        print("Layer " + str(i))
         curr_model = setup_model(model, i, cfg.device)
         sync_model(curr_model)
         
         opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[i])
         
-        for i in range(cfg.num_rounds[0]):
+        for j in range(cfg.num_rounds[0]):
             curr_model.train()
 
-            # TODO copy / detach graph?
+            # TODO copy / detach graph / blocks?
             
-            for i in range(len(train_blocks)):
-                train_blocks[i] = train_blocks[i].detach()
-            
-            loss, train_h_item, train_h_item_dst = curr_model(pos_graph, neg_graph, train_h_item, train_h_item_dst, train_blocks)
+            loss, train_h_item = curr_model(pos_graph, neg_graph, train_h_item, train_h_item_dst, train_blocks)
             loss = loss.mean()
             
             opt.zero_grad()
@@ -417,10 +228,8 @@ def train(
             with torch.no_grad():
                 item_batches = torch.arange(train_graph.num_nodes(item_ntype))
                 h_item_batches = []
-                for i in range(len(test_blocks)):
-                    test_blocks[i] = test_blocks[i].detach()
 
-                repr, val_h_item, val_h_item_dst = curr_model.get_repr(test_blocks, val_h_item, val_h_item_dst)
+                repr, val_h_item = curr_model.get_repr(test_blocks, val_h_item, val_h_item_dst)
                 h_item_batches.append(repr)
                 h_items = torch.cat(h_item_batches, 0)
 

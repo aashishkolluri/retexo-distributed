@@ -156,7 +156,19 @@ class SAGENet(nn.Module):
         return h
 
     def get_nth_layer(self, n):
-        return self.convs[n]
+        return IntermediateSAGENet(self.convs[n], n)
+    
+class IntermediateSAGENet(nn.Module):
+    def __init__(self, conv, n):
+        super().__init__()
+        self.conv = conv
+        self.n = n
+        
+    def forward(self, blocks, h):
+        h_dst = h[: blocks[self.n].num_nodes("DST/" + blocks[self.n].ntypes[0])]
+        h = self.conv(blocks[self.n], (h, h_dst), blocks[self.n].edata["weights"])
+        return h
+            
 
 class ItemToItemScorer(nn.Module):
     def __init__(self, full_graph, ntype):

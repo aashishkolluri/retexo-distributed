@@ -37,7 +37,7 @@ class PinSAGEModel(torch.nn.Module):
         if n == 0:
             return FirstLayerModel(self.proj, scorer)
         
-        sage = self.sage.get_nth_layer(n)
+        sage = self.sage.get_nth_layer(n-1) #1st layer is projector
         
         if n == self.num_layers:
             scorer = self.scorer
@@ -91,6 +91,6 @@ class IntermediateModel(torch.nn.Module):
         # h_item_dst = self.proj(blocks[-1].dstdata)
         next_item = self.sage(blocks, h_item)
         next_item_copy = next_item.detach()
-        return h_item_dst + next_item
+        return h_item_dst + next_item, next_item_copy
     
     

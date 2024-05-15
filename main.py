@@ -9,13 +9,14 @@ import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
 from data.dataset import load_data, graph_partition, rel_graph_partition, load_partition, load_user_item_data
+import trainers.fedgnn_trainer
 import trainers.trainer
 import trainers.rel_trainer
 import trainers.user_item_trainer
 
 # logging.basicConfig(level = logging.INFO)
 
-@hydra.main(config_path="conf", config_name="movie_lens", version_base=None)
+@hydra.main(config_path="conf", config_name="fedgnn", version_base=None)
 def main(cfg: DictConfig) -> None:
     """Run the specified application"""
 
@@ -61,6 +62,21 @@ def main(cfg: DictConfig) -> None:
             p.start()
             p.join()
         
+    elif cfg.app == "fedgnn":
+        train = trainers.fedgnn_trainer
+        if cfg.distributed.backend == "gloo":
+            n_devices = torch.cuda.device_count()
+            devices = [f"{i}" for i in range(n_devices)]
+
+            if "CUDA_VISIBLE_DEVICES" in os.environ:
+                devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+                n_devices = len(devices)
+                
+            torch.multiprocessing.set_start_method('spawn')
+            os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
+            p = mp.Process(target=train.init_process, args=(0, cfg, hydra_output_dir))
+            p.start()
+            p.join()
     elif cfg.app == "train":
         train = trainers.rel_trainer # TODO change depending on cfg
         # train = trainers.trainer
