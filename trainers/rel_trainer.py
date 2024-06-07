@@ -137,7 +137,7 @@ def train_for_one_layer(
         
         agg_time_s = time.time()
         with torch.no_grad():
-            reducer.aggregate_grad(model, batch_train.node_types, all_num_nodes)
+            reducer.aggregate_hetero_grad(model, batch_train.node_types, all_num_nodes)
         agg_time = time.time() - agg_time_s
         
         optimizer.step()
@@ -391,9 +391,9 @@ def train(
     
     for curr_layer in range(1, cfg.model.n_layers + 1):
         
-        send_and_receive_embeddings_pyg(
-            batch_dict["train"], boundary_nodes, x_dicts[0], local_dict, available
-        )
+        # send_and_receive_embeddings_pyg(
+        #     batch_dict["train"], boundary_nodes, x_dicts[0], local_dict, available
+        # )
             
         curr_model = setup_model(model, curr_layer, cfg.device)
         sync_model(curr_model)

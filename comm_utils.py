@@ -406,7 +406,20 @@ class MultiThreadReducerCentralized:
                     self.comm_vol_store.add_cv_grad_reduce_t(cv)
         self._handles.append(self.thread_pool.apply_async(create_stream))
 
-    def aggregate_grad(self, model: nn.Module, node_types, all_num_nodes):
+
+    def aggregate_grad(self, model: nn.Module, num_local_train, num_train):
+        """Aggregate the model across workers using thread pool"""
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        for _, (name, param) in enumerate(model.named_parameters()):
+            param.grad = param.grad * (num_local_train / num_train)
+            self._reduce(rank, world_size, param, name)
+        for handle in self._handles:
+            handle.wait()
+        self._handles.clear()
+        torch.cuda.current_stream().wait_stream(self._stream)
+        
+    def aggregate_hetero_grad(self, model: nn.Module, node_types, all_num_nodes):
         """Aggregate the model across workers using thread pool"""
         rank = dist.get_rank()
         world_size = dist.get_world_size()

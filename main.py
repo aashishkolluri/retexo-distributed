@@ -10,13 +10,14 @@ from omegaconf import DictConfig, OmegaConf
 
 from data.dataset import load_data, graph_partition, rel_graph_partition, load_partition, load_user_item_data
 import trainers.fedgnn_trainer
+import trainers.pos_neg_hetero_trainer
 import trainers.trainer
 import trainers.rel_trainer
 import trainers.user_item_trainer
 
 # logging.basicConfig(level = logging.INFO)
 
-@hydra.main(config_path="conf", config_name="fedgnn", version_base=None)
+@hydra.main(config_path="conf", config_name="news_recommendation", version_base=None)
 def main(cfg: DictConfig) -> None:
     """Run the specified application"""
 
@@ -32,9 +33,9 @@ def main(cfg: DictConfig) -> None:
     
 
     if cfg.app == "partition_data":
-        graph, _, _ = load_data(**cfg.dataset.download)
-        graph_partition(graph, **cfg.dataset.partition)
-        load_partition(cfg.dataset.partition.partition_dir, cfg.dataset.partition.dataset_name, 0)
+        graph, _= load_data(**cfg.dataset.download, cfg=cfg)
+        # graph_partition(graph, **cfg.dataset.partition)
+        # load_partition(cfg.dataset.partition.partition_dir, cfg.dataset.partition.dataset_name, 0)
         return
     elif cfg.app == "partition_relational_data":
         rel_graph_partition(
@@ -46,8 +47,8 @@ def main(cfg: DictConfig) -> None:
         graph_partition(graph, **cfg.dataset.partition)
         temp = load_partition(cfg.dataset.partition.partition_dir, cfg.dataset.partition.dataset_name, 0, task="edge_prediction")
         return
-    elif cfg.app == "centralized_pinsage":
-        train = trainers.user_item_trainer
+    elif cfg.app == "hetero_pos_neg_train":
+        train = trainers.pos_neg_hetero_trainer
         if cfg.distributed.backend == "gloo":
             n_devices = torch.cuda.device_count()
             devices = [f"{i}" for i in range(n_devices)]
@@ -78,8 +79,8 @@ def main(cfg: DictConfig) -> None:
             p.start()
             p.join()
     elif cfg.app == "train":
-        train = trainers.rel_trainer # TODO change depending on cfg
-        # train = trainers.trainer
+        # train = trainers.rel_trainer # TODO change depending on cfg
+        train = trainers.trainer
         
         # set up the distributed training environment
         if cfg.distributed.backend == "gloo":
@@ -91,8 +92,8 @@ def main(cfg: DictConfig) -> None:
                 n_devices = len(devices)
 
             start_id = cfg.node_rank * cfg.parts_per_node
-            # end_id = min(start_id + cfg.parts_per_node, cfg.num_partitions) 
-            end_id = int(start_id + cfg.num_partitions / cfg.parts_per_node)
+            end_id = min(start_id + cfg.parts_per_node, cfg.num_partitions) 
+            # end_id = int(start_id + cfg.num_partitions / cfg.parts_per_node)
             
             process = []
             torch.multiprocessing.set_start_method('spawn')

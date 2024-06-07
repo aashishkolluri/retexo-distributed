@@ -48,7 +48,7 @@ class DistrMindDataset(DistrRelBenchDataset):
         urls = {
             "train":
                 {
-                    "url": "https://mind201910small.blob.core.windows.net/release/MINDlarge_train.zip",
+                    "url": "https://mind201910small.blob.core.windows.net/release/MINDsmall_train.zip",
                     "hash": "dedd2e6ed41ee8bcdc7432c1e90be09dcf4ce711dc1b9497c013a9dfa632caaf"
                 },
             "val": {

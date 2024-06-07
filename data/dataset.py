@@ -12,7 +12,8 @@ from data.rel_stackex import DistrStackExDataset
 from data.movielens_utils import PandasGraphBuilder, train_test_split_by_time, build_train_graph, build_val_test_matrix
 
 from relbench.data import NodeTask, RelBenchDataset
-from data.mind import DistrMindDataset
+from data.old_mind import DistrMindDataset
+from data.mind_dataset import MIND_DGL
 import dgl # type: ignore
 from dgl.data import RedditDataset, YelpDataset, CoraGraphDataset, KarateClubDataset # type: ignore
 from dgl.distributed import partition_graph, GraphPartitionBook # type: ignore
@@ -190,7 +191,7 @@ def load_movielens_dataset(name, data_path):
     
     return g, dataset, train_g
 
-def load_data(dataset_name: str, dataset_dir: str, add_self_loop=False) -> Tuple[dgl.DGLGraph, int, int]:
+def load_data(dataset_name: str, dataset_dir: str, cfg=None, add_self_loop=False) -> Tuple[dgl.DGLGraph, int, int]:
     """Load dataset
 
     Parameters
@@ -314,6 +315,11 @@ def load_data(dataset_name: str, dataset_dir: str, add_self_loop=False) -> Tuple
         graph.ndata["test_mask"][
             torch.tensor([2, 3, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 23, 24, 25, 26])
         ] = True
+    elif dataset_name == "mind":
+        dataset = MIND_DGL(cfg, force_reload=False)
+        graph = dataset.graph
+        return graph, dataset
+        # graph.ndata["label"] = graph.ndata["label"].float()
     else:
         raise ValueError(f"Dataset {dataset_name} is not supported")
 

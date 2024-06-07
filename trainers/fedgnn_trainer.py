@@ -66,12 +66,12 @@ def train(
     num_users = rateBuckets["user-movie"]["train"].shape[0]
     num_items = rateBuckets["movie-user"]["train"].shape[0]
     
-    model = FedGNNModel(num_users, num_items, cfg.model.hidden_dim, 100, cfg.model.dropout)
-    opt = SGD(model.parameters(), lr=cfg.learning_rate[0])
+    model = FedGNNModel(num_users, num_items, cfg.model.hidden_dim, 100, cfg.model.dropout).cuda()
     
     curr_model = setup_model(model, 0, cfg.device)
     sync_model(curr_model)
     
+    opt = SGD(curr_model.parameters(), lr=cfg.learning_rate[0])
     
     # Training Layer 0
     print("Training Layer 0")
@@ -83,20 +83,46 @@ def train(
     itemBuckets = rateBuckets["movie-user"]["train"].to(device)
     # userBuckets = graph.nodes("user").to(device)#rateBuckets["user-movie"]["train"].to(device)
     # itemBuckets = graph.nodes("movie").to(device)#rateBuckets["movie-user"]["train"].to(device)
-    itemFeats = graph.nodes["movie"].data["feat"].to(device)
     
     user_embs = [{} for _ in range(cfg.num_layers + 1)]
     item_embs = [{} for _ in range(cfg.num_layers + 1)]
- 
+    itemFeats = graph.nodes["movie"].data["feat"].to(device)
+    userFeats = graph.nodes["user"].data["feat"].to(device)
+    
     train_graph = graph.edge_subgraph(graph.edata["train_mask"], relabel_nodes=False)
     train_edges = train_graph.edges["user-movie"].data["train_mask"]
     test_edges = graph.edges["user-movie"].data["test_mask"]
-    test_ratings = graph.edges["user-movie"].data["rate"][test_edges].to(device) 
-      
+    test_ratings = graph.edges["user-movie"].data["rate"][test_edges].to(device)
+    train_graph = train_graph.to("cuda")
+    graph = graph.to("cuda")
+    
+    # Global model
+    for round in range(cfg.num_rounds[0]):
+        model.train()
+        
+        out, user_embs[0]["train"], item_embs[0]["train"] = model(train_graph, userFeats, itemFeats, train_edges, "user-movie")
+        
+        # clamp/process the output?
+        
+        loss = mse_loss(out.view(-1), train_ratings)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        # Test on full graph and test edges  
+        model.eval()
+        with torch.no_grad():
+            test_out, user_embs[0]["test"], item_embs[0]["test"] = model(graph, userFeats, itemFeats, test_edges, "user-movie")
+        
+            test_loss = mse_loss(test_out.view(-1), test_ratings) 
+        print("L0 Round: ", round, "Train Loss: ", torch.sqrt(loss).item(), "Test Loss: ", torch.sqrt(test_loss).item())
+        
+    
+    # First layer
     for round in range(cfg.num_rounds[0]):
         curr_model.train()
         
-        out, user_embs[0]["train"], item_embs[0]["train"] = curr_model(train_graph, userBuckets, itemBuckets, train_edges, "user-movie")
+        out, user_embs[0]["train"], item_embs[0]["train"] = curr_model(train_graph, userBuckets, itemFeats, train_edges, "user-movie")
         
         # clamp/process the output?
         
@@ -108,20 +134,18 @@ def train(
         # Test on full graph and test edges  
         curr_model.eval()
         with torch.no_grad():
-            test_out, user_embs[0]["test"], item_embs[0]["test"] = curr_model(graph, userBuckets, itemBuckets, test_edges, "user-movie")
+            test_out, user_embs[0]["test"], item_embs[0]["test"] = curr_model(graph, userBuckets, itemFeats, test_edges, "user-movie")
         
             test_loss = mse_loss(test_out.view(-1), test_ratings)
         
-            print("L0 Round: ", round, "Train Loss: ", torch.sqrt(loss).item(), "Test Loss: ", torch.sqrt(test_loss).item())
-        
+    print("L0 Round: ", round, "Train Loss: ", torch.sqrt(loss).item(), "Test Loss: ", torch.sqrt(test_loss).item())
     
+
     # Remaining layers
-    train_graph = train_graph.to("cuda")
-    graph = graph.to("cuda")
     for curr_layer in range(1, cfg.num_layers + 1):
         curr_model = setup_model(model, curr_layer, cfg.device)
         sync_model(curr_model)
-        opt = SGD(model.parameters(), lr=cfg.learning_rate[curr_layer])
+        opt = SGD(curr_model.parameters(), lr=cfg.learning_rate[curr_layer])
                 
         for round in range(cfg.num_rounds[curr_layer]):
             curr_model.train()
@@ -141,7 +165,7 @@ def train(
             
                 test_loss = mse_loss(test_out.view(-1), test_ratings)
             
-                print("L", curr_layer, "Round: ", round, "Train Loss: ", torch.sqrt(loss).item(), "Test Loss: ", torch.sqrt(test_loss).item())
+        print("L", curr_layer, "Round: ", round, "Train Loss: ", torch.sqrt(loss).item(), "Test Loss: ", torch.sqrt(test_loss).item())
         
     print("TODO")
 
@@ -171,19 +195,24 @@ def init_process(rank, cfg, hydra_output_dir):
     
     # complete processing by creating rate_buckets
 
-    rate_buckets = {}
-    for etype in ["user-movie", "movie-user"]:
-        edges = graph.edges(etype=etype)
-        ids = edges[0]
-        ratings = graph.edges[etype].data['rate'].long() 
-        rate_buckets[etype] = {}
-        for split in ["train", "valid", "test"]:
-            mask = graph.edges[etype].data[split + '_mask']
-            node_type = etype.split('-')[0]
-            rate_buckets[etype][split] = torch.zeros((graph.num_nodes(node_type), 5), dtype=torch.int64)
-            
-            for node, rating in zip(ids[mask], ratings[mask]):
-                rate_buckets[etype][split][node, rating - 1] += 1
+    buckets_path = os.path.join(cfg.dataset_dir, "rate_buckets.pt")
+    if os.path.exists(buckets_path):
+        rate_buckets = torch.load(buckets_path)
+    else:
+        rate_buckets = {}
+        for etype in ["user-movie", "movie-user"]:
+            edges = graph.edges(etype=etype)
+            ids = edges[0]
+            ratings = graph.edges[etype].data['rate'].long() 
+            rate_buckets[etype] = {}
+            for split in ["train", "valid", "test"]:
+                mask = graph.edges[etype].data[split + '_mask']
+                node_type = etype.split('-')[0]
+                rate_buckets[etype][split] = torch.zeros((graph.num_nodes(node_type), 5), dtype=torch.int64)
+                
+                for node, rating in zip(ids[mask], ratings[mask]):
+                    rate_buckets[etype][split][node, rating - 1] += 1
+        torch.save(rate_buckets, buckets_path)
 
 
     # Add rate_buckets as a node feature for users

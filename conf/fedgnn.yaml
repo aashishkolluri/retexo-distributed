@@ -8,8 +8,8 @@ partition_method: "random"
 part_obj: "vol"
 num_partitions: 1
 num_layers: 2
-hidden_dim: 64
-num_rounds: [300, 500, 500]
+hidden_dim: 32
+num_rounds: [20000, 1000, 1000]
 local_epochs: 1
 learning_rate: [0.01, 0.01, 0.01]
 momentum: 0.9
