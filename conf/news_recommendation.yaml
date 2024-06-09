@@ -16,7 +16,7 @@ feat_hidden: 128
 loss_func: 'log_sofmax'
 num_rounds: [2000, 200, 200]
 eval_after: 399
-early_stop: 10
+early_stop: 50
 gnn_neg_ratio: 4
 gnn_kl_weight: 0
 local_epochs: 1

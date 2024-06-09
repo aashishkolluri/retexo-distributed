@@ -572,7 +572,7 @@ class MIND_DGL(DGLDataset):
     def graph(self):
         return self._graph
 
-    def get_gnn_train_loader(self, base_etypes):
+    def get_gnn_train_loader(self, base_etypes, num_layers):
         train_sampled_datasets = building_training_dataset(self._train_session_positive, self._train_session_negative, self.cfg["gnn_neg_ratio"])
         pos_edges = torch.Tensor(train_sampled_datasets[:, 0]).type(torch.int32)
         neg_edges = torch.Tensor(train_sampled_datasets[:, 1:]).type(torch.int32)  
@@ -588,7 +588,7 @@ class MIND_DGL(DGLDataset):
         elif self.cfg['train_sampler'] == 'SimilarityWeightedMultiLayer' or self.cfg['train_sampler'] == 'InverseDegreeWeightedMultiLayer':
             sampler = dgl.dataloading.MultiLayerNeighborSampler(self.cfg['train_sampler_param'], prob='Sampling_Weight', replace=False)
         elif self.cfg['train_sampler'] == 'MultiLayerFull':
-            sampler = dgl.dataloading.MultiLayerFullNeighborSampler(self.cfg['num_layers'])
+            sampler = dgl.dataloading.MultiLayerFullNeighborSampler(num_layers)
         else:
             raise Exception('Unexpected Neighbor Sampler')
 

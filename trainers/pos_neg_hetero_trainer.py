@@ -130,7 +130,7 @@ def train(
     # Optimizer
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
     
-    pos_dataloader, neg_dataloader = dataset.get_gnn_train_loader(base_etypes)
+    pos_dataloader, neg_dataloader = dataset.get_gnn_train_loader(base_etypes, cfg["num_layers"])
     trainloader = enumerate(zip(pos_dataloader, neg_dataloader))
     
     for i, ((pos_input_nodes, pos_sample_graph, pos_blocks), (neg_input_nodes, neg_sample_graph, neg_blocks)) in trainloader:
