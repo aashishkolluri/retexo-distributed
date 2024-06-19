@@ -71,9 +71,9 @@ class MIND_DGL(DGLDataset):
         """
         self._print('Loading raw data ...')
         train_behaviors_df, train_news_df, train_entity_embedding_dict = \
-            load_MIND('{}/MIND{}_train'.format(self.cfg['dataset_dir'], self.cfg['mind_version']), force_reload=self._force_reload)#self._force_reload)
+            load_MIND('{}/MIND{}_train'.format(self.cfg['dataset_dir'], self.cfg['mind_version']), force_reload=False)#self._force_reload)
         dev_behaviors_df, dev_news_df, dev_entity_embedding_dict = \
-            load_MIND('{}/MIND{}_dev'.format(self.cfg['dataset_dir'], self.cfg['mind_version']), force_reload=self._force_reload)#self._force_reload)
+            load_MIND('{}/MIND{}_dev'.format(self.cfg['dataset_dir'], self.cfg['mind_version']), force_reload=False)#self._force_reload)
 
         self._print('Making User-List and News-List ...')
         # User List and News List
@@ -98,16 +98,16 @@ class MIND_DGL(DGLDataset):
         self._dev_session_negative = dev_session_negative
 
         # self._print('Extracting News-Entity ...')
-        # # processing enid and get n-e
-        # entity_embedding_dict = {**train_entity_embedding_dict, **dev_entity_embedding_dict}
-        # train_news_entity_link = get_news_entity_link(train_news_df, newsid2nid, entity_embedding_dict, '{}/MIND{}_train'.format(
-        #     self.cfg['dataset_dir'], self.cfg['mind_version']), self._force_reload)
-        # dev_news_entity_link = get_news_entity_link(dev_news_df, newsid2nid, entity_embedding_dict, '{}/MIND{}_dev'.format(
-        #     self.cfg['dataset_dir'], self.cfg['mind_version']), self._force_reload)
-        # news_entity_link = np.unique(np.concatenate([train_news_entity_link, dev_news_entity_link]), axis=0)
-        # self._entity = [int(v) for v in np.unique(news_entity_link[:, 1]).tolist()]
-        # entityid2enid = {v: k for k, v in enumerate(self._entity)}  # WikidataIds -> enid
-        # news_entity_link[:, 1] = [entityid2enid[oid] for oid in news_entity_link[:, 1]]
+        # processing enid and get n-e
+        entity_embedding_dict = {**train_entity_embedding_dict, **dev_entity_embedding_dict}
+        train_news_entity_link = get_news_entity_link(train_news_df, newsid2nid, entity_embedding_dict, '{}/MIND{}_train'.format(
+            self.cfg['dataset_dir'], self.cfg['mind_version']), self._force_reload)
+        dev_news_entity_link = get_news_entity_link(dev_news_df, newsid2nid, entity_embedding_dict, '{}/MIND{}_dev'.format(
+            self.cfg['dataset_dir'], self.cfg['mind_version']), self._force_reload)
+        news_entity_link = np.unique(np.concatenate([train_news_entity_link, dev_news_entity_link]), axis=0)
+        self._entity = [int(v) for v in np.unique(news_entity_link[:, 1]).tolist()]
+        entityid2enid = {v: k for k, v in enumerate(self._entity)}  # WikidataIds -> enid
+        news_entity_link[:, 1] = [entityid2enid[oid] for oid in news_entity_link[:, 1]]
 
         # self._print('Extracting News-Word ...')
         # # get n-w and emb_w(wid -> emb)
@@ -118,7 +118,7 @@ class MIND_DGL(DGLDataset):
         _nodes = {
             'user': torch.Tensor(list(range(len(self._user)))).type(torch.int32),
             'news': torch.Tensor(list(range(len(self._news)))).type(torch.int32),
-            # 'entity': torch.Tensor(list(range(len(self._entity)))).type(torch.int32),
+            'entity': torch.Tensor(list(range(len(self._entity)))).type(torch.int32),
             # 'word': torch.Tensor(list(range(len(self._word)))).type(torch.int32),
         }
 
@@ -126,10 +126,10 @@ class MIND_DGL(DGLDataset):
         for node_type in _nodes:
             self._num_node[node_type] = int(_nodes[node_type].max()) + 1
 
-        # un_df = pd.DataFrame(history_actions, columns=['uid', 'nid'])
-        # ne_df = pd.DataFrame(news_entity_link, columns=['nid', 'enid'])
+        un_df = pd.DataFrame(history_actions, columns=['uid', 'nid'])
+        ne_df = pd.DataFrame(news_entity_link, columns=['nid', 'enid'])
         # nw_df = pd.DataFrame(news_word_link, columns=['nid', 'wid'])
-        # ue_df = un_df.join(ne_df.set_index('nid'), on='nid', how='inner').sort_values(by=['uid'])[['uid', 'enid']]
+        ue_df = un_df.join(ne_df.set_index('nid'), on='nid', how='inner').sort_values(by=['uid'])[['uid', 'enid']]
         # uw_df = un_df.join(nw_df.set_index('nid'), on='nid', how='inner').sort_values(by=['uid'])[['uid', 'wid']]
 
         _links = {
@@ -138,9 +138,9 @@ class MIND_DGL(DGLDataset):
             ('user', 'pos_dev', 'news'): np.array(dev_positive_actions)[:, :2].tolist(),
             ('user', 'neg_train', 'news'): np.array(train_negative_actions)[:, :2].tolist(),
             ('user', 'neg_dev', 'news'): np.array(dev_negative_actions)[:, :2].tolist(),
-            # ('news', 'ne_link', 'entity'): np.array(news_entity_link).tolist(),
+            ('news', 'ne_link', 'entity'): np.array(news_entity_link).tolist(),
             # ('news', 'nw_link', 'word'): np.array(news_word_link).tolist(),
-            # ('user', 'ue_link', 'entity'): np.array(ue_df).tolist(),
+            ('user', 'ue_link', 'entity'): np.array(ue_df).tolist(),
             # ('user', 'uw_link', 'word'): np.array(uw_df).tolist(),
         }  # in graph, no saving need
 
@@ -204,11 +204,11 @@ class MIND_DGL(DGLDataset):
         print('Num of Empty News Embedding: {} in {}'.format(_empty_news_emb, len(_nodes['news'])))
 
         # self._print('Processing Entity')
-        # # new entity id -> emb
-        # _embedding['entity']['Entity_Embedding'] = torch.zeros([self._num_node['entity'], 100])  # 100 as entity embedding dim
-        # for id, oid in enumerate(self._entity):  # WikidataID
-        #     entity_wiki_id = 'Q{}'.format(oid)
-        #     _embedding['entity']['Entity_Embedding'][id] = torch.Tensor(entity_embedding_dict[entity_wiki_id])
+        # new entity id -> emb
+        _embedding['entity']['Entity_Embedding'] = torch.zeros([self._num_node['entity'], 100])  # 100 as entity embedding dim
+        for id, oid in enumerate(self._entity):  # WikidataID
+            entity_wiki_id = 'Q{}'.format(oid)
+            _embedding['entity']['Entity_Embedding'][id] = torch.Tensor(entity_embedding_dict[entity_wiki_id])
 
         # self._print('Processing Word')
         # _embedding['word']['Word_Embedding'] = torch.Tensor(word_emb)

@@ -1,6 +1,7 @@
 """Implement trainer that oversees end-to-end training process"""
 
 import pickle
+import wandb
 import os
 import logging
 from copy import deepcopy
@@ -76,7 +77,7 @@ def train(
     """Implement end-to-end training process"""
     # set the seed
     set_torch_seed(cfg.seed)
-    base_etypes = ['history', 'history_r']
+    base_etypes = ['history', 'history_r', 'ne_link', 'ne_link_r', 'ue_link', 'ue_link_r']
     node_emb_meta = {
         'user': {
             'Category': 768,
@@ -90,7 +91,13 @@ def train(
             'SubCategory': 768,
             # 'Node2Vec': 128,
         },
+        'entity': {
+            'Entity_Embedding': 100,
+            # 'Node2Vec': 128,
+        },
     }
+    
+    wandb.init(project=f"{cfg.app}-{cfg.dataset_name}", config=dict(cfg))
     
     for ntype in dataset.num_node:
         dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg['hidden_dim'] * 2]).float()
@@ -109,44 +116,402 @@ def train(
 
     log_dir = os.path.join(hydra_output_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    
-    best_acc = 0.0
-    best_metrics = []
-    best_epoch = 0
-    best_model = None
-    global_step = 0
-    not_improved_count = 0
-    acc_training_time = 0
-    global_ct = []
 
 
     # Model
     num_layers = cfg.num_layers
     model = NewsSAGEModel(
-        cfg.feat_hidden, cfg.hidden_dim, cfg.hidden_dim, cfg.hidden_dim, node_emb_meta, device, num_layers, cfg.cross_score, cfg.dropout
+        cfg.adaptor_hidden, cfg.hidden_dim, cfg.hidden_dim, cfg.hidden_dim, node_emb_meta, device, num_layers, cfg.cross_score, cfg.dropout
     ).to(device)
 
+
+    if not cfg.retexo:
+        perf_metrics, epoch, best_epoch = train_end2end(model, dataset, cfg, device, log_dir, hydra_output_dir, base_etypes)
+    else:
+        perf_metrics, epoch, best_epoch = train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_etypes)
+    fstr = '\nDONE after {} iterations\nBest AUC: {} at epoch {}. All metrics: {}'.format(epoch, perf_metrics[0], best_epoch, perf_metrics)
+    print(fstr)
+    with open(log_dir + "/accuracy.txt", "a+") as f:
+        f.write(fstr)
+        
+def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_etypes):
+    curr_layer = 0
+    acc_training_time = 0
+    not_improved = 0
+    global_model = model
+    
+    model = setup_model(global_model, curr_layer, cfg.device)
+    sync_model(model)
+    
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
+    
+    # all train blocks (for layer-wise forward passes)
+    full_pos_dataloader, full_neg_dataloader = dataset.get_gnn_train_loader(base_etypes, 2)
+    assert(len(full_pos_dataloader) == len(full_neg_dataloader) == 1)
+    _, final_pos_sample_graph, all_pos_blocks = next(iter(full_pos_dataloader))
+    _, final_neg_sample_graph, all_neg_blocks = next(iter(full_neg_dataloader))
+    
+    # create the full batch of training edges
+    pos_dataloader, neg_dataloader = dataset.get_gnn_train_loader(base_etypes, 1)
+    assert(len(pos_dataloader) == len(neg_dataloader) == 1)
+    pos_input_nodes, pos_sample_graph, pos_blocks = next(iter(pos_dataloader))
+    neg_input_nodes, neg_sample_graph, neg_blocks = next(iter(neg_dataloader))
+            
+    best_loss = 1000000
+    best_score = 0
+    print("Starting training retexo, Layer 0...")
+    for i in range(cfg.num_rounds[0]):
+        model.train()
+        
+        iter_start_time = time.time()
+        
+        pos_sample_graph = pos_sample_graph.to(device)
+        pos_blocks = [b.to(device) for b in pos_blocks]
+        pos_scores, pos_output_features, pos_gnn_kls = model(pos_sample_graph, pos_blocks, ('user', 'pos_train', 'news'))
+        neg_sample_graph = neg_sample_graph.to(device)
+        neg_blocks = [b.to(device) for b in neg_blocks]
+        neg_scores, neg_output_features, neg_gnn_kls = model(neg_sample_graph, neg_blocks, ('user', 'neg_train', 'news'))
+
+        pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
+        score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
+        
+        if cfg['loss_func'] == 'log_sofmax':
+            pred_loss = (-torch.log_softmax(pred, dim=1).select(1, 0)).mean()
+        elif cfg['loss_func'] == 'cross_entropy':
+            label = torch.cat([torch.ones([pred.shape[0], 1]), torch.zeros([pred.shape[0], cfg['gnn_neg_ratio']])], dim=1).to(device)
+            pred_loss = F.binary_cross_entropy(F.sigmoid(pred), label)
+        else:
+            raise Exception('Unexpected Loss Function')
+
+        loss = pred_loss 
+        wandb.log({f"train loss layer {curr_layer}": loss}, step=(i + 1))
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        if  (i + 1) % cfg.log_every == 0:
+            if cfg.print_all:
+                print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
+                    curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
+                ))
+            with open(log_dir + "/losses_0.txt", "a+") as f:
+                f.write(
+                    f'{curr_layer}:{loss}:{score_diff}\n'
+                )
+        
+        if score_diff < best_score:
+            not_improved += 1
+        else:
+            not_improved = 0
+            best_score = score_diff
+            best_loss = loss
+            best_epoch = i
+            best_model = deepcopy(model.state_dict())
+            
+
+
+        iter_end_time = time.time()
+        iter_elapsed_time = iter_end_time - iter_start_time
+        acc_training_time += iter_elapsed_time  
+        
+        # if i >= 999 and not_improved >= cfg.layer_early_stop[curr_layer]:
+            # break
+        
+    fstr = f'Ending layer {curr_layer} after {i} rounds with loss {best_loss} and score {best_score} (round {best_epoch})\n'
+    print(fstr)
+    with open(log_dir + "/early_stop.txt", "a+") as f:
+        f.write(fstr)
+        
+    print("Layer 0 training finished, encoding features for next layer...")
+      
+    if cfg.best_model:
+        model.load_state_dict(best_model)
+    model.eval()
+    with torch.no_grad():
+        user_dataloader, news_dataloader = dataset.get_gnn_dev_node_loader(base_etypes, cfg.num_layers)
+
+        # user_dataloader = enumerate(user_dataloader)
+        # news_dataloader = enumerate(news_dataloader)
+
+        (user_input_nodes, user_sample_graph, user_blocks) = next(iter(user_dataloader))
+        user_blocks = [b.to(device) for b in user_blocks]
+        (news_input_nodes, news_sample_graph, news_blocks) = next(iter(news_dataloader))
+        news_blocks = [b.to(device) for b in news_blocks]
+        
+        # encoding the eval features 
+        eval_user_features = [model.encode(user_blocks)]#['user'].cpu()]
+        eval_news_features = [model.encode(news_blocks)]#['news'].cpu()]
+        
+        # # prepare graph for evaluation
+        # for ntype in dataset.num_node:
+        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+        # for etype in dataset.num_relation:
+        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+
+        # dataset.graph.nodes['user'].data['GNN_Emb'][user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode([user_blocks[-1]], for_prediction=True)['user'].cpu()
+        # dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode([news_blocks[-1]], for_prediction=True)['news'].cpu()
+        
+        # # middle_user_features = model.encode(user_blocks[1:])
+        # # middle_news_features = model.encode(user_blocks[1:])
+        
+        # if cfg["quick_eval"]:
+        #     result = quick_rec(model, dataset, i, cfg)
+        # else:
+        #     result = full_rec(model, dataset, i, cfg)
+            
+        # fstr = '\nEval after 1st layer Best AUC: {} at epoch {}. All metrics: {}'.format(result[0], best_epoch, result)
+        # print(fstr)
+        # with open(log_dir + "/accuracy.txt", "a+") as f:
+        #     f.write(fstr)
+            
+        # for ntype in dataset.num_node:
+        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+        # for etype in dataset.num_relation:
+        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+            
+        # encoding the training features for last layer
+        final_pos_sample_graph = final_pos_sample_graph.to(device)
+        all_pos_blocks = [b.to(device) for b in all_pos_blocks]
+        final_pos_features = [model.encode(all_pos_blocks)]
+        final_neg_sample_graph = final_neg_sample_graph.to(device)
+        all_neg_blocks = [b.to(device) for b in all_neg_blocks]
+        final_neg_features = [model.encode(all_neg_blocks)]
+        
+        # encoding training features for next layer
+        pos_features = model.encode(pos_blocks)
+        neg_features = model.encode(neg_blocks)
+    
+    
+    # Layer 1
+    curr_layer += 1
+    model = setup_model(global_model, curr_layer, cfg.device)
+    sync_model(model)
+    
+    best_loss = 1000000
+    best_score = 0
+    
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[curr_layer])
+    
+    print(f"Training Layer {curr_layer}...")
+    for i in range(cfg.num_rounds[curr_layer]):
+        model.train()
+        
+        iter_start_time = time.time()
+
+        pos_scores, pos_output_features, pos_gnn_kls = model(pos_sample_graph, pos_blocks, ('user', 'pos_train', 'news'), pos_features)
+        neg_scores, neg_output_features, neg_gnn_kls = model(neg_sample_graph, neg_blocks, ('user', 'neg_train', 'news'), neg_features)
+
+        pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
+        score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
+        
+        if cfg['loss_func'] == 'log_sofmax':
+            pred_loss = (-torch.log_softmax(pred, dim=1).select(1, 0)).mean()
+        elif cfg['loss_func'] == 'cross_entropy':
+            label = torch.cat([torch.ones([pred.shape[0], 1]), torch.zeros([pred.shape[0], cfg['gnn_neg_ratio']])], dim=1).to(device)
+            pred_loss = F.binary_cross_entropy(F.sigmoid(pred), label)
+        else:
+            raise Exception('Unexpected Loss Function')
+
+        loss = pred_loss 
+        wandb.log({f"train loss layer {curr_layer}": loss}, step=curr_layer * (i + 1))
+        
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if  (i + 1) % cfg.log_every == 0:
+            if cfg.print_all:
+                print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
+                    curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
+                ))
+            with open(log_dir + "/losses_1.txt", "a+") as f:
+                f.write(
+                    f'{curr_layer}:{loss}:{score_diff}\n'
+                )
+                
+        if score_diff < best_score:
+            not_improved += 1
+        else:
+            not_improved = 0
+            best_score = score_diff
+            best_loss = loss
+            best_epoch = i
+            
+            best_model = deepcopy(model.state_dict())
+            
+        iter_end_time = time.time()
+        iter_elapsed_time = iter_end_time - iter_start_time
+        acc_training_time += iter_elapsed_time   
+    
+        # if i >= 799 and not_improved >= cfg.layer_early_stop[curr_layer]:
+            # break
+     
+    fstr = f'Ending layer {curr_layer} after {i} rounds with loss {best_loss} and score {best_score}(round {best_epoch})\n'
+    print(fstr)
+    with open(log_dir + "/early_stop.txt", "a+") as f:
+        f.write(fstr)
+        
+        
+    if cfg.best_model:
+        model.load_state_dict(best_model)
+    model.eval()
+    with torch.no_grad():
+        # message passing eval features for last layer
+        eval_user_features.append(model.encode(user_blocks[curr_layer - 1:], eval_user_features[-1]))	
+        eval_news_features.append(model.encode(news_blocks[curr_layer - 1:], eval_news_features[-1]))
+        
+        # # prepare graph for evaluation
+        # for ntype in dataset.num_node:
+        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+        # for etype in dataset.num_relation:
+        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+
+        # dataset.graph.nodes['user'].data['GNN_Emb'][user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(user_blocks[-1:], middle_user_features, for_prediction=True)['user'].cpu()
+        # dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(news_blocks[-1:], middle_news_features, for_prediction=True)['news'].cpu()
+        
+        # if cfg["quick_eval"]:
+        #     result = quick_rec(model, dataset, i, cfg)
+        # else:
+        #     result = full_rec(model, dataset, i, cfg)
+            
+        # fstr = '\nEval after 2nd layer Best AUC: {} at epoch {}. All metrics: {}'.format(result[0], best_epoch, result)
+        # print(fstr)
+        # with open(log_dir + "/accuracy.txt", "a+") as f:
+        #     f.write(fstr)
+            
+        # for ntype in dataset.num_node:
+        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+        # for etype in dataset.num_relation:
+        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+        
+        # message passing the training features for last layer
+        final_pos_features = [model.encode(all_pos_blocks[curr_layer - 1:], final_pos_features[-1])]
+        final_neg_features = [model.encode(all_neg_blocks[curr_layer - 1:], final_neg_features[-1])]
+        
+    # Last GNN Layer (2)
+    curr_layer += 1
+    model = setup_model(global_model, curr_layer, cfg.device)
+    sync_model(model)
+    
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[curr_layer])
+    
+    best_loss = 1000000
+    best_score = 0
+    
+    print(f"Training Layer {curr_layer}...")
+    for i in range(cfg.num_rounds[curr_layer]):
+        model.train()
+        
+        iter_start_time = time.time()
+
+        pos_scores, pos_output_features, pos_gnn_kls = model(final_pos_sample_graph, all_pos_blocks[1:], ('user', 'pos_train', 'news'), final_pos_features[-1])
+        neg_scores, neg_output_features, neg_gnn_kls = model(final_neg_sample_graph, all_neg_blocks[1:], ('user', 'neg_train', 'news'), final_neg_features[-1])
+
+        pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
+        score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
+        
+        if cfg['loss_func'] == 'log_sofmax':
+            pred_loss = (-torch.log_softmax(pred, dim=1).select(1, 0)).mean()
+        elif cfg['loss_func'] == 'cross_entropy':
+            label = torch.cat([torch.ones([pred.shape[0], 1]), torch.zeros([pred.shape[0], cfg['gnn_neg_ratio']])], dim=1).to(device)
+            pred_loss = F.binary_cross_entropy(F.sigmoid(pred), label)
+        else:
+            raise Exception('Unexpected Loss Function')
+
+        loss = pred_loss 
+        wandb.log({f"train loss layer {curr_layer}": loss}, step=curr_layer * (i + 1))
+        
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        if  (i + 1) % cfg.log_every == 0:
+            if cfg.print_all:
+                print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
+                    curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
+                ))
+            with open(log_dir + "/losses_2.txt", "a+") as f:
+                f.write(
+                    f'{curr_layer}:{loss}:{score_diff}\n'
+                )
+
+        if score_diff < best_score:
+            not_improved += 1
+        else:
+            not_improved = 0
+            best_score = score_diff
+            best_loss = loss       
+            best_epoch = i 
+            best_model = deepcopy(model.state_dict())
+
+            
+        iter_end_time = time.time()
+        iter_elapsed_time = iter_end_time - iter_start_time
+        acc_training_time += iter_elapsed_time    
+        
+        # if i >= 799 and not_improved >= cfg.layer_early_stop[curr_layer]:
+            # break
+        
+    fstr = f'Ending layer {curr_layer} after {i} rounds with loss {best_loss} and score {best_score} (round {best_epoch})\n'
+    print(fstr)
+    with open(log_dir + "/early_stop.txt", "a+") as f:
+        f.write(fstr)
+        
+    if cfg.best_model:
+        model.load_state_dict(best_model)
+    model.eval()
+    with torch.no_grad():
+        # message passing eval features for last layer
+        # eval_user_features.append(model.encode(user_blocks[curr_layer - 1:], eval_user_features[-1]))	
+        # eval_news_features.append(model.encode(news_blocks[curr_layer - 1:], eval_news_features[-1]))
+        
+        # prepare graph for evaluation
+        for ntype in dataset.num_node:
+            dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+        for etype in dataset.num_relation:
+            dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+
+        dataset.graph.nodes['user'].data['GNN_Emb'][user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(user_blocks[curr_layer - 1:], eval_user_features[-1])['user'].cpu()
+    
+        dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(news_blocks[curr_layer - 1:], eval_news_features[-1])['news'].cpu()
+        
+        if cfg["quick_eval"]:
+            result = quick_rec(model, dataset, i, cfg)
+        else:
+            result = full_rec(model, dataset, i, cfg)
+            
+        torch.save(best_model, '{}/{}_{}_seed={}.pth'.format(
+                    hydra_output_dir, 
+                    "mind", 
+                    "0", 
+                    cfg.seed
+                ))
+            
+    return result, 0, i
+        
+def train_end2end(model, dataset, cfg, device, log_dir, hydra_output_dir, base_etypes):
+    best_acc = 0.0
+    best_metrics = []
+    best_epoch = 0
+    best_model = None
+    not_improved_count = 0
+    acc_training_time = 0
+    global_ct = []
     
     # Optimizer
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[0])
     
     pos_dataloader, neg_dataloader = dataset.get_gnn_train_loader(base_etypes, cfg["num_layers"])
-    trainloader = enumerate(zip(pos_dataloader, neg_dataloader))
+    assert(len(pos_dataloader) == len(neg_dataloader) == 1)
+    pos_input_nodes, pos_sample_graph, pos_blocks = next(iter(pos_dataloader))
+    neg_input_nodes, neg_sample_graph, neg_blocks = next(iter(neg_dataloader))
     
-    for i, ((pos_input_nodes, pos_sample_graph, pos_blocks), (neg_input_nodes, neg_sample_graph, neg_blocks)) in trainloader:
-        assert i == 0
-        pos_sample_graph = pos_sample_graph
-        pos_blocks = pos_blocks
-        neg_sample_graph = neg_sample_graph
-        neg_blocks = neg_blocks
-    
-    # first layer
-    print("Starting training... Layer 0")
+    print("Starting training End-2-End...")
     for i in range(cfg.num_rounds[0]):
         model.train()
 
         iter_start_time = time.time()
-        # TODO for first layer will need the sample graph to be without message passing (ie. only link prediction on src/dst nodes)
         pos_sample_graph = pos_sample_graph.to(device)
         pos_blocks = [b.to(device) for b in pos_blocks]
         pos_scores, pos_output_features, pos_gnn_kls = model(pos_sample_graph, pos_blocks, ('user', 'pos_train', 'news'))
@@ -165,9 +530,9 @@ def train(
         else:
             raise Exception('Unexpected Loss Function')
         
-        gnn_kl = (sum(pos_gnn_kls) / len(pos_gnn_kls) + sum(neg_gnn_kls) / len(neg_gnn_kls)).mean()
+        # gnn_kl = (sum(pos_gnn_kls) / len(pos_gnn_kls) + sum(neg_gnn_kls) / len(neg_gnn_kls)).mean()
         
-        loss = pred_loss + cfg['gnn_kl_weight'] * gnn_kl
+        loss = pred_loss #+ cfg['gnn_kl_weight'] * gnn_kl
 
         opt.zero_grad()
         loss.backward()
@@ -183,8 +548,8 @@ def train(
 
 
         if i >= cfg.eval_after and (i + 1) % cfg.log_every == 0:
-            print('\nTrain Result @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- KL = {}\n- Score Diff = {}\n'.format(
-                i, loss.item(), pred_loss.item(), gnn_kl.item(), score_diff.item()
+            print('\nTrain Result @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- Score Diff = {}\n'.format(
+                i, loss.item(), pred_loss.item(), score_diff.item()
             ))
             result = eval(base_etypes, dataset,  cfg.hidden_dim, device, model, i, cfg)
             this_acc = result[0]
@@ -208,10 +573,8 @@ def train(
                 not_improved_count += 1
                 if not_improved_count >= cfg.early_stop:
                     break
-    fstr = '\nDONE after {} iterations\nBest AUC: {} at epoch {}. All metrics: {}'.format(i, best_acc, best_epoch, best_metrics)
-    print(fstr)
-    with open(log_dir + "/accuracy.txt", "a+") as f:
-        f.write(fstr)
+
+    return best_metrics, i, best_epoch
         
 
 def eval(etypes, mind_dgl, out_dim, device, model, epoch, cfg):
@@ -268,9 +631,7 @@ def init_process(rank, cfg, hydra_output_dir):
     print(f"Rank {rank:2} | Total time taken: {time.time() - start_time:2.4f} s")
 
     dist.destroy_process_group()
-
-
-
+    
 def encode_all_graph(model, mind_dgl, device, etypes, attention_head=4):
     print('Generating GNN Representation')
     model.eval()
@@ -293,9 +654,7 @@ def encode_all_graph(model, mind_dgl, device, etypes, attention_head=4):
     print('Generating GNN Representation Finished')
     
     
-def full_rec(model, mind_dgl, epoch, cfg):
-    # testing performance w/o EDC using randomly sampled users
-    
+def full_rec(model, mind_dgl, epoch, cfg):    
     dev_session_loader = mind_dgl.get_dev_session_loader(shuffle=False)
     cache_size = cfg.cache_size 
     
@@ -312,7 +671,7 @@ def full_rec(model, mind_dgl, epoch, cfg):
     epoch_ilad_10 = 0
 
 
-    devloader = enumerate(dev_session_loader)
+    devloader = tqdm(enumerate(dev_session_loader))
 
     print("Evaluating...\n")
     for i, (pos_links, neg_links) in devloader:

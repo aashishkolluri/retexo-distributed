@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from dgl.nn import GraphConv # type: ignore
 from models.base_model import BaseGNN
-from dgl.nn.pytorch import HeteroGraphConv, SAGEConv, GATv2Conv
+from dgl.nn.pytorch import HeteroGraphConv, SAGEConv, GATv2Conv, GraphConv
 import torch.nn.functional as F
 
 
@@ -50,6 +50,7 @@ class NewsSAGEModel(BaseGNN):
     ) -> None:
         super().__init__()
         self.n_layers = n_layers
+        self.cross_score = cross_score
         self.device = device
         self.node_emb_data = emb_data
         self.hetero_convs = nn.ModuleList()
@@ -57,11 +58,18 @@ class NewsSAGEModel(BaseGNN):
             self.hetero_convs.append(HeteroGraphConv({
             'history': SAGEConv(hidden_dim, hidden_dim, 'mean'),
             'history_r': SAGEConv(hidden_dim, hidden_dim, 'mean'),#GATv2Conv(hidden_dim, hidden_dim, 4)#
+            'ne_link': SAGEConv(hidden_dim, hidden_dim, 'mean'),
+            'ne_link_r': SAGEConv(hidden_dim, hidden_dim, 'mean'),
+            'ue_link': SAGEConv(hidden_dim, hidden_dim, 'mean'),
+            'ue_link_r': SAGEConv(hidden_dim, hidden_dim, 'mean'),
         }))
-        
+
+
+        self.dropout_rate = dropout        
         self.dropout = nn.Dropout(dropout)
         self.activation = activation
         self.output_dim = output_dim
+        self.input_dim = input_dim
         
         self.attr_set = {}
         self.adaptor_align = nn.ModuleDict()
@@ -87,7 +95,21 @@ class NewsSAGEModel(BaseGNN):
             for node_type in fusioner_router
         }).to(device)
         
-        self.denser = nn.Linear(input_dim, output_dim * 2)
+        # Attention layer
+        self.attention_layer = nn.MultiheadAttention(embed_dim=768, num_heads=1, batch_first=True)
+        self.projection_layer = nn.Linear(768, hidden_dim)
+        
+        self.projection_layer = nn.ModuleDict({
+            node_type: nn.Linear(768, hidden_dim)
+            for node_type in emb_data
+        })
+        
+        # self.batch_norms = nn.ModuleDict({
+        #     node_type: nn.BatchNorm1d(output_dim * 2) 
+        #     for node_type in emb_data
+        # })
+        
+        self.denser = nn.Linear(self.input_dim, self.output_dim * 2)
         self.scorer = ScorePredictor(output_dim, device, cross_score=cross_score)
         
     def adapt(self, blocks):
@@ -141,7 +163,7 @@ class NewsSAGEModel(BaseGNN):
             ))
         return self.scorer(edge_subgraph, output_features, scoring_edge), output_features, kls
     
-    def encode(self, blocks):
+    def encode(self, blocks, for_prediction=False):
         adapted_features = self.adapt(blocks)
         input_features = self.fusion(adapted_features)
         
@@ -177,52 +199,198 @@ class NewsSAGEModel(BaseGNN):
         nn.Module
             The nth layer, object with forward method
         """
-        conv_layer = self.convs[n]
-        layer_norm = nn.LayerNorm(conv_layer._out_feats)
-        clf_layer = nn.Linear(conv_layer._out_feats, self.output_dim)
-
-        if n == len(self.convs) - 1:
-            return IntermediateModel(conv_layer, nn.Sequential(), self.dropout)
-
-        if self.use_layer_norm:
-            intermediate_model = IntermediateModel(
-                conv_layer, nn.Sequential(layer_norm, nn.ReLU(), clf_layer), self.dropout
+        batch_norms = nn.ModuleDict({
+            node_type: nn.BatchNorm1d(self.output_dim * 2) 
+            for node_type in self.node_emb_data
+        })
+        denser = nn.Linear(self.input_dim, self.output_dim * 2)
+        scorer = ScorePredictor(self.output_dim, self.device, cross_score=self.cross_score)
+        
+        # first layer (no GNN)
+        if n == 0:
+            return IntermediateModel(
+                self.device,
+                self.node_emb_data,
+                # self.projection_layer,
+                # self.attention_layer,
+                self.adaptor_align, 
+                self.fusioner_router, 
+                self.fusioner, 
+                None, 
+                self.dropout,
+                denser, 
+                scorer
+                )
+        # last GNN layer
+        if n == len(self.hetero_convs):
+            return IntermediateModel(
+                self.device,
+                self.node_emb_data,
+                # self.projection_layer,
+                # self.attention_layer,
+                None, 
+                None,
+                None,
+                self.hetero_convs[n - 1],
+                self.dropout,
+                self.denser,
+                self.scorer,
+                isLast=True
+                )
+            
+        # intermediate GNN layer
+        return IntermediateModel(
+            self.device,
+            self.node_emb_data,
+            # self.projection_layer,
+            # self.attention_layer,
+            None, 
+            None,
+            None,
+            self.hetero_convs[n-1],
+            self.dropout,
+            denser,
+            scorer            
             )
-        else:
-            intermediate_model = IntermediateModel(
-                conv_layer, nn.Sequential(nn.ReLU(), clf_layer), self.dropout
-            )
-        return intermediate_model
+        
 
 class IntermediateModel(nn.Module):
     """Model with one aggregation layer and multiple following layers"""
 
-    def __init__(self, agg_layer, following_layers, dropout) -> None:
+    def __init__(self, device, node_emb_data, 
+                # projection_layer,
+                # attention_layer,
+                 adaptor_align,
+                 fusioner_router, 
+                 fusioner,
+                 conv, dropout, denser, scorer, isLast=False) -> None:
         super().__init__()
-        self.agg_layer = agg_layer
-        self.following_layers = following_layers
+        self.device = device
+        self.node_emb_data = node_emb_data
+        # self.projection_layer = projection_layer
+        # self.attention_layer = attention_layer
+        self.adaptor_align = adaptor_align
+        self.fusioner_router = fusioner_router
+        self.fusioner = fusioner
+        self.hetero_conv = conv
         self.dropout = dropout
+        self.denser = denser
+        self.scorer = scorer
+        self.isLast = isLast
+                
+    def adapt(self, blocks, encode_source=True):
+        input_features = {}
+        for node_type in self.node_emb_data:
+            node_attr = []
+            for emb_type in self.node_emb_data[node_type]:
+                # Directly fetch features from blocks[0].srcdata without using embeddings
+                if encode_source:
+                    node_attr.append(self.adaptor_align[emb_type](
+                        blocks[0].srcdata[emb_type][node_type].to(self.device)
+                    ).unsqueeze(1))
+                else:
+                    node_attr.append(self.adaptor_align[emb_type](
+                        blocks[0].dstdata[emb_type][node_type].to(self.device) #todo
+                    ).unsqueeze(1))
+            node_attr = torch.cat(node_attr, dim=1)
+            node_attr, _ = attention(node_attr, node_attr, node_attr, self.device)
+            input_features[node_type] = node_attr
+        return input_features
+    
+    def fusion(self, adapted_features):
+        input_features = {}
+        for node_type in adapted_features:
+            if adapted_features[node_type].shape[0] == 0:
+                continue
+            else:
+                input_features[node_type] = self.fusioner(
+                    torch.matmul(self.fusioner_router[node_type], adapted_features[node_type]).reshape(adapted_features[node_type].shape[0], -1)
+                )
+        return input_features
 
-    def forward(
-        self, graph, input_features: torch.Tensor, *args, **kwargs
-    ) -> torch.Tensor:
+    def adapt_attention(self, blocks, encode_source=True):
+        input_features = {}
+        for node_type in self.node_emb_data:
+            node_attr = []
+            for emb_type in self.node_emb_data[node_type]:
+                if encode_source:
+                    feature_data = blocks[0].srcdata[emb_type][node_type].to(self.device)
+                else:
+                    feature_data = blocks[0].dstdata[emb_type][node_type].to(self.device)
+                node_attr.append(feature_data.unsqueeze(1))                
+            node_attr = torch.cat(node_attr, dim=1)
+            node_attr, _ = self.attention_layer(node_attr, node_attr, node_attr)
+            node_attr = self.projection_layer[node_type](node_attr)
+            input_features[node_type] = node_attr.mean(1)
+        return input_features
+
+    def forward(self, edge_subgraph, blocks, scoring_edge, input_features=None):
         """Forward pass"""
-        x = input_features
-        x = self.dropout(x)
-        x = self.agg_layer(graph, x)
-        # for gatconv
-        if len(x.shape) == 3:
-            # take average along second dimension and keep the first dimension
-            x = x.mean(dim=1)
+        if self.hetero_conv is None:
+            # adapted_features = self.adapt_attention(blocks, encode_source=False)
+            # input_features = adapted_features
+            adapted_features = self.adapt(blocks, encode_source=False)
+            input_features = self.fusion(adapted_features)
+            
+        else:
+            assert input_features is not None
+            
+            input_features = self.hetero_conv(blocks[0], input_features)
+            input_features = {k: F.relu(v) for k, v in input_features.items()}
+            # if self.dropout is not None:
+            input_features = {k: self.dropout(v) for k, v in input_features.items()}
+            
+            
+        output_features = input_features
+        for node_type in output_features:
+            output_features[node_type] = self.denser(output_features[node_type])
+            # output_features[node_type] = self.batch_norms[node_type](output_features[node_type]) 
+            output_features[node_type] = self.dropout(output_features[node_type])
+            
+        kls = []
+        for node_type in output_features:
+            kls.append(kl(
+                output_features[node_type][:, :self.denser.in_features], 
+                output_features[node_type][:, self.denser.in_features:]
+            ))
+        return self.scorer(edge_subgraph, output_features, scoring_edge), {k: v.detach() for k, v in output_features.items()}, kls
 
-        if "hidden_layer" in kwargs and kwargs["hidden_layer"]:
-            if len(self.following_layers) > 2:
-                for layer in self.following_layers[:-1]:
-                    x = layer(x)
-            if len(self.following_layers) == 2:
-                # x = F.layer_norm(x, (x.shape[1],))
-                x = nn.ReLU()(x)
-            return x
-        for layer in self.following_layers:
-            x = layer(x)
-        return x
+    def encode(self, blocks, input_features=None, for_prediction=False):
+        if self.hetero_conv is None:
+            # adapted_features = self.adapt_attention(blocks, encode_source=True)
+            # input_features = adapted_features
+            adapted_features = self.adapt(blocks, encode_source=True)
+            input_features = self.fusion(adapted_features)
+            
+        
+            # TODO for first layer should we still apply the denser?
+            if not for_prediction:
+                return {k: v.detach() for k, v in input_features.items()}
+
+        else:
+            assert input_features is not None
+            input_features =  self.hetero_conv(blocks[0], input_features)
+            input_features = {k: F.relu(v) for k, v in input_features.items()}
+        
+        if not self.isLast and not for_prediction: 
+            # intermediate layer, skip denser
+            return {k: v.detach() for k, v in input_features.items()}
+        
+        # if self.dropout is not None:
+        #     input_features = {k: self.dropout(v) for k, v in input_features.items()}
+            
+            
+        output_features = input_features
+            
+        for node_type in output_features:
+            output_features[node_type] = self.denser(output_features[node_type])
+            # output_features[node_type] = self.batch_norms[node_type](output_features[node_type])  # Apply batch normalization
+            output_features[node_type] = self.dropout(output_features[node_type])
+            
+        kls = []
+        for node_type in output_features:
+            kls.append(kl(
+                output_features[node_type][:, :self.denser.in_features], 
+                output_features[node_type][:, self.denser.in_features:]
+            ))
+        return output_features

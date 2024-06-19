@@ -22,12 +22,6 @@ def main(cfg: DictConfig) -> None:
     """Run the specified application"""
 
     print(OmegaConf.to_yaml(cfg))
-
-    # load_rel_partition(partition_dir=(f"{cfg.partition_dir}/{cfg.dataset_name}"), dataset_name=cfg.dataset_name, task_name=cfg.task.name, part_id=3)
-    # rel_graph_partition(
-        # "mind", f"{cfg.partition_dir}/{cfg.dataset_name}", cfg.num_partitions, cfg
-        # )  
-
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
     

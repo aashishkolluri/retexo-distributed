@@ -257,7 +257,7 @@ class ScorePredictor(nn.Module):
     
     def get_decay_weight(self, delta_t):
         shape = delta_t.shape
-        return torch.Tensor([math.exp(- 0.05 * math.pow(dt, 0.5)) for dt in delta_t.reshape(-1)]).reshape(shape)
+        return torch.Tensor([math.exp(- 0.2* math.pow(dt, 0.25)) for dt in delta_t.reshape(-1)]).reshape(shape)
 
     def forward(self, edge_subgraph, x, scoring_edge):
         with edge_subgraph.local_scope():
