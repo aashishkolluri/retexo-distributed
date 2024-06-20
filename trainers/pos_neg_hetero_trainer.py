@@ -1,6 +1,7 @@
 """Implement trainer that oversees end-to-end training process"""
 
 import pickle
+import random
 import wandb
 import os
 import logging
@@ -97,7 +98,7 @@ def train(
         },
     }
     
-    wandb.init(project=f"{cfg.app}-{cfg.dataset_name}", config=dict(cfg))
+    wandb.init(project=f"{cfg.app}-{cfg.dataset_name}", config=dict(cfg), mode=cfg.wandb_mode)
     
     for ntype in dataset.num_node:
         dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg['hidden_dim'] * 2]).float()
@@ -154,145 +155,228 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
     # create the full batch of training edges
     pos_dataloader, neg_dataloader = dataset.get_gnn_train_loader(base_etypes, 1)
     assert(len(pos_dataloader) == len(neg_dataloader) == 1)
-    pos_input_nodes, pos_sample_graph, pos_blocks = next(iter(pos_dataloader))
-    neg_input_nodes, neg_sample_graph, neg_blocks = next(iter(neg_dataloader))
-            
-    best_loss = 1000000
-    best_score = 0
-    print("Starting training retexo, Layer 0...")
-    for i in range(cfg.num_rounds[0]):
-        model.train()
-        
-        iter_start_time = time.time()
-        
-        pos_sample_graph = pos_sample_graph.to(device)
-        pos_blocks = [b.to(device) for b in pos_blocks]
-        pos_scores, pos_output_features, pos_gnn_kls = model(pos_sample_graph, pos_blocks, ('user', 'pos_train', 'news'))
-        neg_sample_graph = neg_sample_graph.to(device)
-        neg_blocks = [b.to(device) for b in neg_blocks]
-        neg_scores, neg_output_features, neg_gnn_kls = model(neg_sample_graph, neg_blocks, ('user', 'neg_train', 'news'))
+    _, pos_sample_graph, pos_blocks = next(iter(pos_dataloader))
+    _, neg_sample_graph, neg_blocks = next(iter(neg_dataloader))
+    
+    pos_sample_graph = pos_sample_graph.to(device)
+    pos_blocks = [b.to(device) for b in pos_blocks]
+    neg_sample_graph = neg_sample_graph.to(device)
+    neg_blocks = [b.to(device) for b in neg_blocks]
+    
+    del pos_dataloader
+    del neg_dataloader
+    del full_pos_dataloader
+    del full_neg_dataloader
 
-        pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
-        score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
-        
-        if cfg['loss_func'] == 'log_sofmax':
-            pred_loss = (-torch.log_softmax(pred, dim=1).select(1, 0)).mean()
-        elif cfg['loss_func'] == 'cross_entropy':
-            label = torch.cat([torch.ones([pred.shape[0], 1]), torch.zeros([pred.shape[0], cfg['gnn_neg_ratio']])], dim=1).to(device)
-            pred_loss = F.binary_cross_entropy(F.sigmoid(pred), label)
-        else:
-            raise Exception('Unexpected Loss Function')
+    # validation blocks
+    user_dataloader, news_dataloader = dataset.get_gnn_dev_node_loader(base_etypes, cfg.num_layers)
+    (__annotations__, _, user_blocks) = next(iter(user_dataloader))
+    val_user_blocks = [b.to(device) for b in user_blocks]
+    (_, _, news_blocks) = next(iter(news_dataloader))
+    val_news_blocks = [b.to(device) for b in news_blocks]
+    
+    del user_dataloader
+    del news_dataloader
 
-        loss = pred_loss 
-        wandb.log({f"train loss layer {curr_layer}": loss}, step=(i + 1))
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        
-        if  (i + 1) % cfg.log_every == 0:
-            if cfg.print_all:
-                print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
-                    curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
-                ))
-            with open(log_dir + "/losses_0.txt", "a+") as f:
-                f.write(
-                    f'{curr_layer}:{loss}:{score_diff}\n'
-                )
-        
-        if score_diff < best_score:
-            not_improved += 1
-        else:
-            not_improved = 0
-            best_score = score_diff
-            best_loss = loss
-            best_epoch = i
-            best_model = deepcopy(model.state_dict())
-            
-
-
-        iter_end_time = time.time()
-        iter_elapsed_time = iter_end_time - iter_start_time
-        acc_training_time += iter_elapsed_time  
-        
-        # if i >= 999 and not_improved >= cfg.layer_early_stop[curr_layer]:
-            # break
-        
-    fstr = f'Ending layer {curr_layer} after {i} rounds with loss {best_loss} and score {best_score} (round {best_epoch})\n'
-    print(fstr)
-    with open(log_dir + "/early_stop.txt", "a+") as f:
-        f.write(fstr)
+    
+    best_epoch, best_model = train_embedding_layer(model, dataset, cfg, device, log_dir, opt, pos_sample_graph, pos_blocks, neg_sample_graph, neg_blocks, val_user_blocks, val_news_blocks)
         
     print("Layer 0 training finished, encoding features for next layer...")
+
       
     if cfg.best_model:
         model.load_state_dict(best_model)
     model.eval()
     with torch.no_grad():
-        user_dataloader, news_dataloader = dataset.get_gnn_dev_node_loader(base_etypes, cfg.num_layers)
+        # # encoding the eval features 
+        eval_user_features = [model.encode(val_user_blocks, encode_source=True)]#['user'].cpu()]
+        eval_news_features = [model.encode(val_news_blocks, encode_source=True)]#['news'].cpu()]
+        
+        middle_user_features = model.encode(val_user_blocks[1:], encode_source=True)
+        middle_news_features = model.encode(val_news_blocks[1:], encode_source=True)
 
-        # user_dataloader = enumerate(user_dataloader)
-        # news_dataloader = enumerate(news_dataloader)
-
-        (user_input_nodes, user_sample_graph, user_blocks) = next(iter(user_dataloader))
-        user_blocks = [b.to(device) for b in user_blocks]
-        (news_input_nodes, news_sample_graph, news_blocks) = next(iter(news_dataloader))
-        news_blocks = [b.to(device) for b in news_blocks]
-        
-        # encoding the eval features 
-        eval_user_features = [model.encode(user_blocks)]#['user'].cpu()]
-        eval_news_features = [model.encode(news_blocks)]#['news'].cpu()]
-        
-        # # prepare graph for evaluation
-        # for ntype in dataset.num_node:
-        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
-        # for etype in dataset.num_relation:
-        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
-
-        # dataset.graph.nodes['user'].data['GNN_Emb'][user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode([user_blocks[-1]], for_prediction=True)['user'].cpu()
-        # dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode([news_blocks[-1]], for_prediction=True)['news'].cpu()
-        
-        # # middle_user_features = model.encode(user_blocks[1:])
-        # # middle_news_features = model.encode(user_blocks[1:])
-        
-        # if cfg["quick_eval"]:
-        #     result = quick_rec(model, dataset, i, cfg)
-        # else:
-        #     result = full_rec(model, dataset, i, cfg)
-            
-        # fstr = '\nEval after 1st layer Best AUC: {} at epoch {}. All metrics: {}'.format(result[0], best_epoch, result)
-        # print(fstr)
-        # with open(log_dir + "/accuracy.txt", "a+") as f:
-        #     f.write(fstr)
-            
-        # for ntype in dataset.num_node:
-        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
-        # for etype in dataset.num_relation:
-        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
-            
         # encoding the training features for last layer
         final_pos_sample_graph = final_pos_sample_graph.to(device)
         all_pos_blocks = [b.to(device) for b in all_pos_blocks]
-        final_pos_features = [model.encode(all_pos_blocks)]
+        final_pos_features = [model.encode(all_pos_blocks,encode_source=True)]
         final_neg_sample_graph = final_neg_sample_graph.to(device)
         all_neg_blocks = [b.to(device) for b in all_neg_blocks]
-        final_neg_features = [model.encode(all_neg_blocks)]
+        final_neg_features = [model.encode(all_neg_blocks,encode_source=True)]
         
         # encoding training features for next layer
-        pos_features = model.encode(pos_blocks)
-        neg_features = model.encode(neg_blocks)
+        pos_features = model.encode(pos_blocks, encode_source=True)
+        neg_features = model.encode(neg_blocks, encode_source=True)
     
+    torch.save(model, '{}/{}_layer{}_seed={}_ckt={}.pth'.format(
+            hydra_output_dir, 
+            "mind", 
+            curr_layer, 
+            cfg.seed,
+            best_epoch if cfg.best_model else cfg.num_rounds[curr_layer]
+        ))
     
     # Layer 1
     curr_layer += 1
     model = setup_model(global_model, curr_layer, cfg.device)
     sync_model(model)
-    
-    best_loss = 1000000
-    best_score = 0
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[curr_layer])
+        
+        
+    best_epoch, best_model = train_gnn_layer(model, dataset, cfg, device, log_dir, curr_layer, opt, pos_sample_graph, pos_blocks, neg_sample_graph, neg_blocks, val_user_blocks, val_news_blocks, middle_user_features, middle_news_features, pos_features, neg_features)
+        
+        
+    if cfg.best_model:
+        model.load_state_dict(best_model)
+    model.eval()
+    with torch.no_grad():
+        # message passing eval features for last layer
+        eval_user_features.append(model.encode(val_user_blocks[curr_layer - 1:], eval_user_features[-1]))	
+        eval_news_features.append(model.encode(val_news_blocks[curr_layer - 1:], eval_news_features[-1]))
+        
+        # message passing the training features for last layer
+        final_pos_features = [model.encode(all_pos_blocks[curr_layer - 1:], final_pos_features[-1])]
+        final_neg_features = [model.encode(all_neg_blocks[curr_layer - 1:], final_neg_features[-1])]
+        
+    torch.save(model, '{}/{}_layer{}_seed={}_ckt={}.pth'.format(
+            hydra_output_dir, 
+            "mind", 
+            curr_layer, 
+            cfg.seed,
+            best_epoch if cfg.best_model else cfg.num_rounds[curr_layer]
+        ))
+            
+    # Last GNN Layer (2)
+    curr_layer += 1
+    model = setup_model(global_model, curr_layer, cfg.device)
+    sync_model(model)
     
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[curr_layer])
     
+    best_epoch, best_model = train_gnn_layer(model, dataset, cfg, device, log_dir, curr_layer, opt, final_pos_sample_graph, all_pos_blocks[1:], final_neg_sample_graph, all_neg_blocks[1:], val_user_blocks, val_news_blocks,  eval_user_features[-1],  eval_news_features[-1], final_pos_features[-1], final_neg_features[-1])
+    
+    # best_loss = 1000000
+    # best_score = 0
+    # best_auc = 0
+    
+    # print(f"Training Layer {curr_layer}...")
+    # for i in range(cfg.num_rounds[curr_layer]):
+    #     model.train()
+        
+    #     iter_start_time = time.time()
+
+    #     pos_scores, pos_output_features, pos_gnn_kls = model(final_pos_sample_graph, all_pos_blocks[1:], ('user', 'pos_train', 'news'), final_pos_features[-1])
+    #     neg_scores, neg_output_features, neg_gnn_kls = model(final_neg_sample_graph, all_neg_blocks[1:], ('user', 'neg_train', 'news'), final_neg_features[-1])
+
+    #     pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
+    #     score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
+        
+    #     if cfg['loss_func'] == 'log_sofmax':
+    #         pred_loss = (-torch.log_softmax(pred, dim=1).select(1, 0)).mean()
+    #     elif cfg['loss_func'] == 'cross_entropy':
+    #         label = torch.cat([torch.ones([pred.shape[0], 1]), torch.zeros([pred.shape[0], cfg['gnn_neg_ratio']])], dim=1).to(device)
+    #         pred_loss = F.binary_cross_entropy(F.sigmoid(pred), label)
+    #     else:
+    #         raise Exception('Unexpected Loss Function')
+
+    #     loss = pred_loss 
+    #     wandb.log({f"train loss": loss}, step=cfg.num_rounds[0] + cfg.num_rounds[1]   + (i + 1))
+    #     wandb.log({f"score diff": score_diff}, step=cfg.num_rounds[0] + cfg.num_rounds[1]   + (i + 1))
+        
+    #     opt.zero_grad()
+    #     loss.backward()
+    #     opt.step()
+        
+    #     if  (i + 1) % cfg.log_every == 0:
+    #         if cfg.print_all:
+    #             print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
+    #                 curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
+    #             ))
+    #         with open(log_dir + "/losses_2.txt", "a+") as f:
+    #             f.write(
+    #                 f'{curr_layer}:{loss}:{score_diff}\n'
+    #             )
+
+    #     if  i > cfg.eval_after[curr_layer] and (i + 1) % cfg.eval_every[curr_layer] == 0:
+    #         model.eval()
+    #         print(f"Evaluating epoch {i}...")
+    #         with torch.no_grad():             
+    #             # prepare graph for evaluation
+    #             for ntype in dataset.num_node:
+    #                 dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+    #             for etype in dataset.num_relation:
+    #                 dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+
+    #             dataset.graph.nodes['user'].data['GNN_Emb'][val_user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(val_user_blocks[curr_layer - 1:], eval_user_features[-1])['user'].cpu()
+    
+    #             dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(val_news_blocks[curr_layer - 1:], eval_news_features[-1])['news'].cpu()
+                        
+    #             result = quick_eval(model, dataset, i, cfg)
+            
+    #         wandb.log({
+    #         f"auc": result[0],
+    #         f"mrr": result[1],
+    #         f"ndgc@5": result[2],
+    #         f"ndgc@10": result[3]
+    #         }, step=cfg.num_rounds[0] + cfg.num_rounds[1]  + i + 1)
+            
+    #         if result[0] > best_auc:
+    #             best_auc = result[0]
+    #             best_loss = loss
+    #             best_score = score_diff
+    #             best_epoch = i
+    #             best_model = deepcopy(model.state_dict())           
+
+        
+    # fstr = f'Ending layer {curr_layer} after {i} rounds with auc {best_auc} loss {best_loss} and score {best_score} (round {best_epoch})\n'
+    # print(fstr)
+    # with open(log_dir + "/early_stop.txt", "a+") as f:
+    #     f.write(fstr)
+        
+    if cfg.best_model:
+        model.load_state_dict(best_model)
+    model.eval()
+    with torch.no_grad():
+        # prepare graph for evaluation
+        for ntype in dataset.num_node:
+            dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+        for etype in dataset.num_relation:
+            dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+
+        dataset.graph.nodes['user'].data['GNN_Emb'][val_user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(val_user_blocks[curr_layer - 1:], eval_user_features[-1])['user'].cpu()
+    
+        dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(val_news_blocks[curr_layer - 1:], eval_news_features[-1])['news'].cpu()
+        
+        if cfg["quick_eval"]:
+            result = quick_rec(model, dataset, cfg.num_rounds[curr_layer], cfg)
+        else:
+            result = full_rec(model, dataset, cfg.num_rounds[curr_layer], cfg)
+        
+        wandb.log({
+            f"auc": result[0],
+            f"mrr": result[1],
+            f"ndgc@5": result[2],
+            f"ndgc@10": result[3]
+            })
+        wandb.run.summary["auc"] = result[0]
+        wandb.run.summary["mrr"] = result[1]
+        wandb.run.summary["ndgc@5"] = result[2]
+        wandb.run.summary["ndgc@10"] = result[3]
+        
+        torch.save(model, '{}/{}_layer{}_seed={}_ckt={}.pth'.format(
+            hydra_output_dir, 
+            "mind", 
+            curr_layer, 
+            cfg.seed,
+            best_epoch if cfg.best_model else cfg.num_rounds[curr_layer]
+        ))
+            
+    return result, 0, i
+
+def train_gnn_layer(model, dataset, cfg, device, log_dir, curr_layer, opt, pos_sample_graph, pos_blocks, neg_sample_graph, neg_blocks, val_user_blocks, val_news_blocks, val_user_features, val_news_features, pos_features, neg_features):
+    best_loss = 1000000
+    best_score = 0
+    best_auc = 0
+  
     print(f"Training Layer {curr_layer}...")
     for i in range(cfg.num_rounds[curr_layer]):
         model.train()
@@ -314,7 +398,8 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
             raise Exception('Unexpected Loss Function')
 
         loss = pred_loss 
-        wandb.log({f"train loss layer {curr_layer}": loss}, step=curr_layer * (i + 1))
+        wandb.log({f"train loss": loss}, step=sum(cfg.num_rounds[:curr_layer]) + (i + 1))
+        wandb.log({f"score diff": score_diff}, step=sum(cfg.num_rounds[:curr_layer]) + (i + 1))
         
         opt.zero_grad()
         loss.backward()
@@ -330,83 +415,60 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
                     f'{curr_layer}:{loss}:{score_diff}\n'
                 )
                 
-        if score_diff < best_score:
-            not_improved += 1
-        else:
-            not_improved = 0
-            best_score = score_diff
-            best_loss = loss
-            best_epoch = i
-            
-            best_model = deepcopy(model.state_dict())
-            
-        iter_end_time = time.time()
-        iter_elapsed_time = iter_end_time - iter_start_time
-        acc_training_time += iter_elapsed_time   
+        if  i > cfg.eval_after[curr_layer] and (i + 1) % cfg.eval_every[curr_layer] == 0:
+            model.eval()
+            print(f"Evaluating epoch {i}...")
+            with torch.no_grad():             
+                # prepare graph for evaluation
+                for ntype in dataset.num_node:
+                    dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+                for etype in dataset.num_relation:
+                    dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+
+                dataset.graph.nodes['user'].data['GNN_Emb'][val_user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(val_user_blocks[-1:], val_user_features, for_prediction=True)['user'].cpu()
     
-        # if i >= 799 and not_improved >= cfg.layer_early_stop[curr_layer]:
-            # break
+                dataset.graph.nodes['news'].data['GNN_Emb'][val_news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(val_news_blocks[-1:], val_news_features, for_prediction=True)['news'].cpu()
+                        
+                result = quick_eval(model, dataset, i, cfg)
+            
+            wandb.log({
+            f"auc": result[0],
+            f"mrr": result[1],
+            f"ndgc@5": result[2],
+            f"ndgc@10": result[3]
+            }, step=sum(cfg.num_rounds[:curr_layer]) + i + 1)
+            
+            if result[0] > best_auc:
+                best_auc = result[0]
+                best_loss = loss
+                best_score = score_diff
+                best_epoch = i
+                best_model = deepcopy(model.state_dict())     
+    
      
-    fstr = f'Ending layer {curr_layer} after {i} rounds with loss {best_loss} and score {best_score}(round {best_epoch})\n'
+    fstr = f'Ending layer {curr_layer} after {i} rounds with auc {best_auc} loss {best_loss} and score {best_score} (round {best_epoch})\n'
     print(fstr)
     with open(log_dir + "/early_stop.txt", "a+") as f:
         f.write(fstr)
-        
-        
-    if cfg.best_model:
-        model.load_state_dict(best_model)
-    model.eval()
-    with torch.no_grad():
-        # message passing eval features for last layer
-        eval_user_features.append(model.encode(user_blocks[curr_layer - 1:], eval_user_features[-1]))	
-        eval_news_features.append(model.encode(news_blocks[curr_layer - 1:], eval_news_features[-1]))
-        
-        # # prepare graph for evaluation
-        # for ntype in dataset.num_node:
-        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
-        # for etype in dataset.num_relation:
-        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
+    return best_epoch, best_model
 
-        # dataset.graph.nodes['user'].data['GNN_Emb'][user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(user_blocks[-1:], middle_user_features, for_prediction=True)['user'].cpu()
-        # dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(news_blocks[-1:], middle_news_features, for_prediction=True)['news'].cpu()
-        
-        # if cfg["quick_eval"]:
-        #     result = quick_rec(model, dataset, i, cfg)
-        # else:
-        #     result = full_rec(model, dataset, i, cfg)
-            
-        # fstr = '\nEval after 2nd layer Best AUC: {} at epoch {}. All metrics: {}'.format(result[0], best_epoch, result)
-        # print(fstr)
-        # with open(log_dir + "/accuracy.txt", "a+") as f:
-        #     f.write(fstr)
-            
-        # for ntype in dataset.num_node:
-        #     dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
-        # for etype in dataset.num_relation:
-        #     dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
-        
-        # message passing the training features for last layer
-        final_pos_features = [model.encode(all_pos_blocks[curr_layer - 1:], final_pos_features[-1])]
-        final_neg_features = [model.encode(all_neg_blocks[curr_layer - 1:], final_neg_features[-1])]
-        
-    # Last GNN Layer (2)
-    curr_layer += 1
-    model = setup_model(global_model, curr_layer, cfg.device)
-    sync_model(model)
-    
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[curr_layer])
-    
+def train_embedding_layer(model, dataset, cfg, device, log_dir, opt, pos_sample_graph, pos_blocks, neg_sample_graph, neg_blocks, val_user_blocks, val_news_blocks):
     best_loss = 1000000
     best_score = 0
-    
-    print(f"Training Layer {curr_layer}...")
-    for i in range(cfg.num_rounds[curr_layer]):
+    best_auc = 0
+    curr_layer = 0
+    print("Starting training retexo, Layer 0...")
+    for i in range(cfg.num_rounds[0]):
         model.train()
         
         iter_start_time = time.time()
-
-        pos_scores, pos_output_features, pos_gnn_kls = model(final_pos_sample_graph, all_pos_blocks[1:], ('user', 'pos_train', 'news'), final_pos_features[-1])
-        neg_scores, neg_output_features, neg_gnn_kls = model(final_neg_sample_graph, all_neg_blocks[1:], ('user', 'neg_train', 'news'), final_neg_features[-1])
+        
+        pos_sample_graph = pos_sample_graph.to(device)
+        pos_blocks = [b.to(device) for b in pos_blocks]
+        pos_scores, pos_output_features, _ = model(pos_sample_graph, pos_blocks, ('user', 'pos_train', 'news'))
+        neg_sample_graph = neg_sample_graph.to(device)
+        neg_blocks = [b.to(device) for b in neg_blocks]
+        neg_scores, neg_output_features, _ = model(neg_sample_graph, neg_blocks, ('user', 'neg_train', 'news'))
 
         pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
         score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
@@ -420,7 +482,8 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
             raise Exception('Unexpected Loss Function')
 
         loss = pred_loss 
-        wandb.log({f"train loss layer {curr_layer}": loss}, step=curr_layer * (i + 1))
+        wandb.log({f"train loss": loss}, step=(i + 1))
+        wandb.log({f"score diff": score_diff}, step=(i + 1))
         
         opt.zero_grad()
         loss.backward()
@@ -431,64 +494,46 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
                 print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
                     curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
                 ))
-            with open(log_dir + "/losses_2.txt", "a+") as f:
+            with open(log_dir + "/losses_0.txt", "a+") as f:
                 f.write(
                     f'{curr_layer}:{loss}:{score_diff}\n'
                 )
+                
+        if  i > cfg.eval_after[curr_layer] and (i + 1) % cfg.eval_every[curr_layer] == 0:
+            model.eval()
+            print(f"Evaluating epoch {i}...")
+            with torch.no_grad():        
+                # prepare graph for evaluation
+                for ntype in dataset.num_node:
+                    dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
+                for etype in dataset.num_relation:
+                    dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
 
-        if score_diff < best_score:
-            not_improved += 1
-        else:
-            not_improved = 0
-            best_score = score_diff
-            best_loss = loss       
-            best_epoch = i 
-            best_model = deepcopy(model.state_dict())
-
+                dataset.graph.nodes['user'].data['GNN_Emb'][val_user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode([val_user_blocks[-1]], for_prediction=True)['user'].cpu()
+                dataset.graph.nodes['news'].data['GNN_Emb'][val_news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode([val_news_blocks[-1]], for_prediction=True)['news'].cpu()
+                
+                result = quick_eval(model, dataset, i, cfg)
             
-        iter_end_time = time.time()
-        iter_elapsed_time = iter_end_time - iter_start_time
-        acc_training_time += iter_elapsed_time    
+            wandb.log({
+            f"auc": result[0],
+            f"mrr": result[1],
+            f"ndgc@5": result[2],
+            f"ndgc@10": result[3]
+            }, step=(i + 1))
+            
+            if result[0] > best_auc:
+                best_auc = result[0]
+                best_loss = loss
+                best_score = score_diff
+                best_epoch = i
+                best_model = deepcopy(model.state_dict())            
+
         
-        # if i >= 799 and not_improved >= cfg.layer_early_stop[curr_layer]:
-            # break
-        
-    fstr = f'Ending layer {curr_layer} after {i} rounds with loss {best_loss} and score {best_score} (round {best_epoch})\n'
+    fstr = f'Ending layer {curr_layer} after {i} rounds with auc {best_auc} loss {best_loss} and score {best_score} (round {best_epoch})\n'
     print(fstr)
     with open(log_dir + "/early_stop.txt", "a+") as f:
         f.write(fstr)
-        
-    if cfg.best_model:
-        model.load_state_dict(best_model)
-    model.eval()
-    with torch.no_grad():
-        # message passing eval features for last layer
-        # eval_user_features.append(model.encode(user_blocks[curr_layer - 1:], eval_user_features[-1]))	
-        # eval_news_features.append(model.encode(news_blocks[curr_layer - 1:], eval_news_features[-1]))
-        
-        # prepare graph for evaluation
-        for ntype in dataset.num_node:
-            dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
-        for etype in dataset.num_relation:
-            dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
-
-        dataset.graph.nodes['user'].data['GNN_Emb'][user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(user_blocks[curr_layer - 1:], eval_user_features[-1])['user'].cpu()
-    
-        dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(news_blocks[curr_layer - 1:], eval_news_features[-1])['news'].cpu()
-        
-        if cfg["quick_eval"]:
-            result = quick_rec(model, dataset, i, cfg)
-        else:
-            result = full_rec(model, dataset, i, cfg)
-            
-        torch.save(best_model, '{}/{}_{}_seed={}.pth'.format(
-                    hydra_output_dir, 
-                    "mind", 
-                    "0", 
-                    cfg.seed
-                ))
-            
-    return result, 0, i
+    return best_epoch, best_model
         
 def train_end2end(model, dataset, cfg, device, log_dir, hydra_output_dir, base_etypes):
     best_acc = 0.0
@@ -547,7 +592,7 @@ def train_end2end(model, dataset, cfg, device, log_dir, hydra_output_dir, base_e
         acc_training_time += iter_elapsed_time
 
 
-        if i >= cfg.eval_after and (i + 1) % cfg.log_every == 0:
+        if i >= cfg.eval_after[0] and (i + 1) % cfg.log_every[0] == 0:
             print('\nTrain Result @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- Score Diff = {}\n'.format(
                 i, loss.item(), pred_loss.item(), score_diff.item()
             ))
@@ -730,6 +775,74 @@ def full_rec(model, mind_dgl, epoch, cfg):
 
     return [epoch_auc_score, epoch_mrr, epoch_ndcg_5, epoch_ndcg_10, epoch_ilad_5, epoch_ilad_10]
 
+
+
+def quick_eval(model, mind_dgl, epoch, cfg):
+    epoch_auc_score = 0
+    epoch_mrr = 0
+    epoch_ndcg_5 = 0
+    epoch_ndcg_10 = 0
+    epoch_ilad_5 = 0
+    epoch_ilad_10 = 0
+    
+    # create validation samples
+    val_session_loader = mind_dgl.get_val_session_loader(cfg.val_size)
+    loader = tqdm(enumerate(val_session_loader))
+
+    for i, (pos_links, neg_links) in loader:
+        if cfg['gnn_quick_dev_reco'] and i >= cfg['gnn_quick_dev_reco_size']:
+            break
+        sub_g = dgl.edge_subgraph(mind_dgl.graph, {('news', 'pos_dev_r', 'user'): pos_links, ('news', 'neg_dev_r', 'user'): neg_links})
+        sub_g.apply_nodes(model.scorer.get_representation, ntype='user')
+        sub_g.apply_nodes(model.scorer.get_representation, ntype='news')
+        sub_g.update_all(model.scorer.msgfunc_score_neg, model.scorer.reduce_score_neg, etype=('news', 'neg_dev_r', 'user'))
+        sub_g.update_all(model.scorer.msgfunc_score_pos, model.scorer.reduce_score_pos, etype=('news', 'pos_dev_r', 'user'))
+
+        labels = torch.cat([torch.ones(sub_g.nodes['user'].data['pos_score'].shape), torch.zeros(sub_g.nodes['user'].data['neg_score'].shape)], dim=1).type(torch.int32).squeeze(0)
+        scores = torch.cat([sub_g.nodes['user'].data['pos_score'], sub_g.nodes['user'].data['neg_score']], dim=1).squeeze(0)
+        news_representation = torch.cat([sub_g.nodes['user'].data['pos_news_representation'], sub_g.nodes['user'].data['neg_news_representation']], dim=1).squeeze(0)
+        
+        auc_score = auc(labels.numpy(), scores.numpy())
+        mrr_score = mrr(labels.numpy(), scores.numpy())
+        ndcg_5 = nDCG(labels.unsqueeze(0).numpy(), scores.unsqueeze(0).numpy(), k=5)
+        ndcg_10 = nDCG(labels.unsqueeze(0).numpy(), scores.unsqueeze(0).numpy(), k=10)
+        
+        epoch_auc_score += auc_score
+        epoch_mrr += mrr_score
+        epoch_ndcg_5 += ndcg_5
+        epoch_ndcg_10 += ndcg_10
+
+        if news_representation.shape[0] >= 5:
+            top_5_news_representation = news_representation[torch.topk(scores, k=5).indices]
+        else:
+            top_5_news_representation = news_representation
+        top_5_news_representation = (top_5_news_representation.T / top_5_news_representation.norm(dim=1)).T
+        
+        if news_representation.shape[0] >= 10:
+            top_10_news_representation = news_representation[torch.topk(scores, k=10).indices]
+        else:
+            top_10_news_representation = news_representation
+        top_10_news_representation = (top_10_news_representation.T / top_10_news_representation.norm(dim=1)).T
+
+    if cfg['gnn_quick_dev_reco']:
+        epoch_auc_score /= cfg['gnn_quick_dev_reco_size']
+        epoch_mrr /= cfg['gnn_quick_dev_reco_size']
+        epoch_ndcg_5 /= cfg['gnn_quick_dev_reco_size']
+        epoch_ndcg_10 /= cfg['gnn_quick_dev_reco_size']
+        epoch_ilad_5 /= cfg['gnn_quick_dev_reco_size']
+        epoch_ilad_10 /= cfg['gnn_quick_dev_reco_size']
+    else:
+        epoch_auc_score /= len(val_session_loader)
+        epoch_mrr /= len(val_session_loader)
+        epoch_ndcg_5 /= len(val_session_loader)
+        epoch_ndcg_10 /= len(val_session_loader)
+        epoch_ilad_5 /= len(val_session_loader)
+        epoch_ilad_10 /= len(val_session_loader)
+            
+
+    # print('Testing Result @ Epoch = {}\n- AUC = {}\n- MRR = {}\n- nDCG@5 = {}\n- nDCG@10 = {}\n- ILAD@5 = {}\n- ILAD@10 = {}\n'.format(epoch, epoch_auc_score, epoch_mrr, epoch_ndcg_5, epoch_ndcg_10, epoch_ilad_5, epoch_ilad_10))
+
+    return [epoch_auc_score, epoch_mrr, epoch_ndcg_5, epoch_ndcg_10, epoch_ilad_5, epoch_ilad_10]
 
 def quick_rec(model, mind_dgl, epoch, cfg):
     # testing performance w/o EDC using randomly sampled users

@@ -355,11 +355,11 @@ class IntermediateModel(nn.Module):
             ))
         return self.scorer(edge_subgraph, output_features, scoring_edge), {k: v.detach() for k, v in output_features.items()}, kls
 
-    def encode(self, blocks, input_features=None, for_prediction=False):
+    def encode(self, blocks, input_features=None, for_prediction=False, encode_source=True):
         if self.hetero_conv is None:
             # adapted_features = self.adapt_attention(blocks, encode_source=True)
             # input_features = adapted_features
-            adapted_features = self.adapt(blocks, encode_source=True)
+            adapted_features = self.adapt(blocks, encode_source=not for_prediction)
             input_features = self.fusion(adapted_features)
             
         

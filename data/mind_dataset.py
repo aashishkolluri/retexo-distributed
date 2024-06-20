@@ -1,3 +1,4 @@
+import random
 from omegaconf import DictConfig
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -39,6 +40,7 @@ class MIND_DGL(DGLDataset):
         self._verbose = verbose
         self._raw_dir = cfg["dataset_dir"]
         self._save_dir = cfg["dataset_dir"]
+        self._indices = None
         
         self.cfg = cfg
 
@@ -616,6 +618,14 @@ class MIND_DGL(DGLDataset):
         dev_dataset = SessionDataset(self._dev_session_positive, self._dev_session_negative)
         # shuffle=False if Decaying is activted
         return DataLoader(dev_dataset, batch_size=1, shuffle=shuffle, num_workers=1)
+    
+    def get_val_session_loader(self, size):
+        if self._indices == None:
+            self._indices = random.sample(range(len(self._dev_session_positive)), size)
+        dev_dataset = SessionDataset([self._dev_session_positive[i] for i in self._indices], [self._dev_session_negative[i] for i in self._indices])
+        
+        # shuffle=False if Decaying is activted
+        return DataLoader(dev_dataset, batch_size=1, shuffle=True, num_workers=1)
 
     def get_gnn_dev_node_loader(self, etypes, num_layers):  # Dev - for Generate Node Representations
         pos_edges = torch.Tensor(list(range(self._num_link['pos_dev_r']))).type(torch.int32)
