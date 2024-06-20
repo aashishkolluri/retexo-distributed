@@ -253,84 +253,6 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
     opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate[curr_layer])
     
     best_epoch, best_model = train_gnn_layer(model, dataset, cfg, device, log_dir, curr_layer, opt, final_pos_sample_graph, all_pos_blocks[1:], final_neg_sample_graph, all_neg_blocks[1:], val_user_blocks, val_news_blocks,  eval_user_features[-1],  eval_news_features[-1], final_pos_features[-1], final_neg_features[-1])
-    
-    # best_loss = 1000000
-    # best_score = 0
-    # best_auc = 0
-    
-    # print(f"Training Layer {curr_layer}...")
-    # for i in range(cfg.num_rounds[curr_layer]):
-    #     model.train()
-        
-    #     iter_start_time = time.time()
-
-    #     pos_scores, pos_output_features, pos_gnn_kls = model(final_pos_sample_graph, all_pos_blocks[1:], ('user', 'pos_train', 'news'), final_pos_features[-1])
-    #     neg_scores, neg_output_features, neg_gnn_kls = model(final_neg_sample_graph, all_neg_blocks[1:], ('user', 'neg_train', 'news'), final_neg_features[-1])
-
-    #     pred = torch.cat([pos_scores.unsqueeze(1), neg_scores.reshape(-1, cfg['gnn_neg_ratio'])], dim=1)
-    #     score_diff = (F.sigmoid(pred)[:, 0] - F.sigmoid(pred)[:, 0:].mean(dim=1)).mean()
-        
-    #     if cfg['loss_func'] == 'log_sofmax':
-    #         pred_loss = (-torch.log_softmax(pred, dim=1).select(1, 0)).mean()
-    #     elif cfg['loss_func'] == 'cross_entropy':
-    #         label = torch.cat([torch.ones([pred.shape[0], 1]), torch.zeros([pred.shape[0], cfg['gnn_neg_ratio']])], dim=1).to(device)
-    #         pred_loss = F.binary_cross_entropy(F.sigmoid(pred), label)
-    #     else:
-    #         raise Exception('Unexpected Loss Function')
-
-    #     loss = pred_loss 
-    #     wandb.log({f"train loss": loss}, step=cfg.num_rounds[0] + cfg.num_rounds[1]   + (i + 1))
-    #     wandb.log({f"score diff": score_diff}, step=cfg.num_rounds[0] + cfg.num_rounds[1]   + (i + 1))
-        
-    #     opt.zero_grad()
-    #     loss.backward()
-    #     opt.step()
-        
-    #     if  (i + 1) % cfg.log_every == 0:
-    #         if cfg.print_all:
-    #             print('\nTrain Result Layer {} @ Iter = {}\n- Training Loss = {}\n- Predict Loss = {}\n- \n- Score Diff = {}\n'.format(
-    #                 curr_layer, i, loss.item(), pred_loss.item(), score_diff.item()
-    #             ))
-    #         with open(log_dir + "/losses_2.txt", "a+") as f:
-    #             f.write(
-    #                 f'{curr_layer}:{loss}:{score_diff}\n'
-    #             )
-
-    #     if  i > cfg.eval_after[curr_layer] and (i + 1) % cfg.eval_every[curr_layer] == 0:
-    #         model.eval()
-    #         print(f"Evaluating epoch {i}...")
-    #         with torch.no_grad():             
-    #             # prepare graph for evaluation
-    #             for ntype in dataset.num_node:
-    #                 dataset.graph.nodes[ntype].data['GNN_Emb'] = torch.zeros([dataset.num_node[ntype], cfg.hidden_dim * 2]).float()
-    #             for etype in dataset.num_relation:
-    #                 dataset.graph.edges[etype].data['Sampling_Weight'] = torch.ones([dataset.num_relation[etype]]).float() * 0.5
-
-    #             dataset.graph.nodes['user'].data['GNN_Emb'][val_user_blocks[-1].dstdata['_ID']['user'].long()] = model.encode(val_user_blocks[curr_layer - 1:], eval_user_features[-1])['user'].cpu()
-    
-    #             dataset.graph.nodes['news'].data['GNN_Emb'][news_blocks[-1].dstdata['_ID']['news'].long()] = model.encode(val_news_blocks[curr_layer - 1:], eval_news_features[-1])['news'].cpu()
-                        
-    #             result = quick_eval(model, dataset, i, cfg)
-            
-    #         wandb.log({
-    #         f"auc": result[0],
-    #         f"mrr": result[1],
-    #         f"ndgc@5": result[2],
-    #         f"ndgc@10": result[3]
-    #         }, step=cfg.num_rounds[0] + cfg.num_rounds[1]  + i + 1)
-            
-    #         if result[0] > best_auc:
-    #             best_auc = result[0]
-    #             best_loss = loss
-    #             best_score = score_diff
-    #             best_epoch = i
-    #             best_model = deepcopy(model.state_dict())           
-
-        
-    # fstr = f'Ending layer {curr_layer} after {i} rounds with auc {best_auc} loss {best_loss} and score {best_score} (round {best_epoch})\n'
-    # print(fstr)
-    # with open(log_dir + "/early_stop.txt", "a+") as f:
-    #     f.write(fstr)
         
     if cfg.best_model:
         model.load_state_dict(best_model)
@@ -370,7 +292,7 @@ def train_retexo(model, dataset, cfg, device, log_dir, hydra_output_dir, base_et
             best_epoch if cfg.best_model else cfg.num_rounds[curr_layer]
         ))
             
-    return result, 0, i
+    return result, 0, best_epoch
 
 def train_gnn_layer(model, dataset, cfg, device, log_dir, curr_layer, opt, pos_sample_graph, pos_blocks, neg_sample_graph, neg_blocks, val_user_blocks, val_news_blocks, val_user_features, val_news_features, pos_features, neg_features):
     best_loss = 1000000
