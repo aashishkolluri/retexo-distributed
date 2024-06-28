@@ -1,6 +1,7 @@
 # default configuration
 
 app: "hetero_pos_neg_train" # hetero_pos_neg_train, partition_data
+retexo: true
 custom_note: "none"
 dataset_name: "mind"
 mind_version: "small"
@@ -13,21 +14,27 @@ num_partitions: 1
 num_layers: 2
 hidden_dim: 128
 feat_hidden: 128
-loss_func: 'log_sofmax'
-num_rounds: [2000, 200, 200]
-eval_after: 399
+adaptor_hidden: 256
+loss_func: 'cross_entropy'
+num_rounds: [20, 20, 20]
 early_stop: 50
+layer_early_stop: [500, 500, 500]
 gnn_neg_ratio: 4
 gnn_kl_weight: 0
 local_epochs: 1
-learning_rate: [1e-3, 1e-3, 1e-3]
+learning_rate: [5e-4, 1e-3, 1e-3]
 momentum: 0.9
 weight_decay: 0.0005
+eval_every: [5, 5, 5]
+eval_after: [9, 9, 9]
+val_size: 10
+wandb_mode: "offline"
 cross_score: false
 dropout: 0
-seed: 42
-log_every: 50
-best_val_model: true
+seed: 7
+log_every: 10
+print_all: false
+best_model: true
 node_rank: 0
 parts_per_node: 4
 device: "cuda"
@@ -35,10 +42,11 @@ measure_dv: false
 sleep_time: 0.0
 cache_size: 5
 debug: true
+federated: false
 
-quick_eval: true
-gnn_quick_dev_reco: true
-gnn_quick_dev_reco_size: 5000
+quick_eval: false
+gnn_quick_dev_reco: false
+gnn_quick_dev_reco_size: 10000
 
 dataset:
   download:
@@ -76,7 +84,7 @@ distributed:
   backend: "gloo"
   init_method: "tcp://"
   master_addr: 127.0.0.1
-  master_port: "10012"
+  master_port: "10011"
 
 task:
   _target_: tasks.node_classification.NodeClassificationTask

@@ -244,7 +244,7 @@ class NewsSAGEModel(BaseGNN):
             self.node_emb_data,
             # self.projection_layer,
             # self.attention_layer,
-            None, 
+            None,
             None,
             None,
             self.hetero_convs[n-1],
@@ -277,7 +277,8 @@ class IntermediateModel(nn.Module):
         self.denser = denser
         self.scorer = scorer
         self.isLast = isLast
-                
+
+    
     def adapt(self, blocks, encode_source=True):
         input_features = {}
         for node_type in self.node_emb_data:

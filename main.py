@@ -11,9 +11,15 @@ from omegaconf import DictConfig, OmegaConf
 from data.dataset import load_data, graph_partition, rel_graph_partition, load_partition, load_user_item_data
 import trainers.fedgnn_trainer
 import trainers.pos_neg_hetero_trainer
+import trainers.pos_neg_hetero_trainer_networking
 import trainers.trainer
 import trainers.rel_trainer
 import trainers.user_item_trainer
+
+
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 # logging.basicConfig(level = logging.INFO)
 
@@ -25,6 +31,28 @@ def main(cfg: DictConfig) -> None:
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
     
+    # temporary code to handle keys locally for test
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+    with open("private_key.pem", "wb") as private_file:
+        private_file.write(
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+        )
+    with open("public_key.pem", "wb") as public_file:
+        public_file.write(
+            public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
 
     if cfg.app == "partition_data":
         graph, _= load_data(**cfg.dataset.download, cfg=cfg)
@@ -42,20 +70,44 @@ def main(cfg: DictConfig) -> None:
         temp = load_partition(cfg.dataset.partition.partition_dir, cfg.dataset.partition.dataset_name, 0, task="edge_prediction")
         return
     elif cfg.app == "hetero_pos_neg_train":
-        train = trainers.pos_neg_hetero_trainer
-        if cfg.distributed.backend == "gloo":
-            n_devices = torch.cuda.device_count()
-            devices = [f"{i}" for i in range(n_devices)]
+        if cfg.federated:
+            train = trainers.pos_neg_hetero_trainer_networking
+            if cfg.distributed.backend == "gloo":
+                # if cfg.master: 
+                    # rank = 0
+                    # init_master(cfg, hydra_output_dir)
+                # else:
+                    n_devices = torch.cuda.device_count()
+                    devices = [f"{i}" for i in range(n_devices)]
 
-            if "CUDA_VISIBLE_DEVICES" in os.environ:
-                devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-                n_devices = len(devices)
-                
-            torch.multiprocessing.set_start_method('spawn')
-            os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
-            p = mp.Process(target=train.init_process, args=(0, cfg, hydra_output_dir))
-            p.start()
-            p.join()
+                    if "CUDA_VISIBLE_DEVICES" in os.environ:
+                        devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+                        n_devices = len(devices)
+                        
+                    torch.multiprocessing.set_start_method('spawn')
+                    os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
+                    master_p = mp.Process(target=train.init_master, args=(cfg, hydra_output_dir))
+                    worker_p = mp.Process(target=train.init_process, args=(1, cfg, hydra_output_dir))
+                    
+                    master_p.start()
+                    worker_p.start()
+                    master_p.join()
+                    worker_p.join()
+        else:
+            train = trainers.pos_neg_hetero_trainer
+            if cfg.distributed.backend == "gloo":
+                n_devices = torch.cuda.device_count()
+                devices = [f"{i}" for i in range(n_devices)]
+
+                if "CUDA_VISIBLE_DEVICES" in os.environ:
+                    devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+                    n_devices = len(devices)
+                    
+                torch.multiprocessing.set_start_method('spawn')
+                os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
+                p = mp.Process(target=train.init_process, args=(0, cfg, hydra_output_dir))
+                p.start()
+                p.join()
         
     elif cfg.app == "fedgnn":
         train = trainers.fedgnn_trainer
