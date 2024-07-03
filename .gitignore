@@ -1,4 +1,5 @@
 /outputs/
 /results/
 /data/rel-stackex/
+/wandb/
 __pycache__/

@@ -644,11 +644,17 @@ def init_master(cfg, hydra_output_dir):
             
 def init_process(rank, cfg, hydra_output_dir):
     """Initialize the distributed environment"""
+    
+    addr = cfg.distributed.master_addr
+    port = cfg.distributed.master_port
 
-    os.environ["MASTER_ADDR"] = cfg.distributed.master_addr
-    os.environ["MASTER_PORT"] = cfg.distributed.master_port
+    os.environ["MASTER_ADDR"] = addr
+    os.environ["MASTER_PORT"] = port
     dist.init_process_group(
-        cfg.distributed.backend, rank=rank, world_size=cfg.num_partitions+1
+        cfg.distributed.backend, 
+        # init_method=f'tcp://{addr}:{port}',
+        rank=rank, 
+        world_size=cfg.num_partitions+1
     )
 
     seed_everything(cfg.seed)

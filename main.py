@@ -31,28 +31,28 @@ def main(cfg: DictConfig) -> None:
     # get the hydra output directory
     hydra_output_dir = HydraConfig.get().runtime.output_dir
     
-    # temporary code to handle keys locally for test
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
-    public_key = private_key.public_key()
-    with open("private_key.pem", "wb") as private_file:
-        private_file.write(
-            private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-        )
-    with open("public_key.pem", "wb") as public_file:
-        public_file.write(
-            public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-        )
+    # # temporary code to handle keys locally for test
+    # private_key = rsa.generate_private_key(
+    #     public_exponent=65537,
+    #     key_size=2048,
+    #     backend=default_backend()
+    # )
+    # public_key = private_key.public_key()
+    # with open("private_key.pem", "wb") as private_file:
+    #     private_file.write(
+    #         private_key.private_bytes(
+    #             encoding=serialization.Encoding.PEM,
+    #             format=serialization.PrivateFormat.PKCS8,
+    #             encryption_algorithm=serialization.NoEncryption()
+    #         )
+    #     )
+    # with open("public_key.pem", "wb") as public_file:
+    #     public_file.write(
+    #         public_key.public_bytes(
+    #             encoding=serialization.Encoding.PEM,
+    #             format=serialization.PublicFormat.SubjectPublicKeyInfo
+    #         )
+    #     )
 
     if cfg.app == "partition_data":
         graph, _= load_data(**cfg.dataset.download, cfg=cfg)
@@ -73,26 +73,22 @@ def main(cfg: DictConfig) -> None:
         if cfg.federated:
             train = trainers.pos_neg_hetero_trainer_networking
             if cfg.distributed.backend == "gloo":
-                # if cfg.master: 
-                    # rank = 0
-                    # init_master(cfg, hydra_output_dir)
-                # else:
-                    n_devices = torch.cuda.device_count()
-                    devices = [f"{i}" for i in range(n_devices)]
+                n_devices = torch.cuda.device_count()
+                devices = [f"{i}" for i in range(n_devices)]
 
-                    if "CUDA_VISIBLE_DEVICES" in os.environ:
-                        devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-                        n_devices = len(devices)
-                        
-                    torch.multiprocessing.set_start_method('spawn')
-                    os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
-                    master_p = mp.Process(target=train.init_master, args=(cfg, hydra_output_dir))
-                    worker_p = mp.Process(target=train.init_process, args=(1, cfg, hydra_output_dir))
+                if "CUDA_VISIBLE_DEVICES" in os.environ:
+                    devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+                    n_devices = len(devices)
                     
-                    master_p.start()
-                    worker_p.start()
-                    master_p.join()
-                    worker_p.join()
+                torch.multiprocessing.set_start_method('spawn')
+                os.environ["CUDA_VISIBLE_DEVICES"] = devices[0]
+                # master_p = mp.Process(target=train.init_master, args=(cfg, hydra_output_dir))
+                worker_p = mp.Process(target=train.init_process, args=(1, cfg, hydra_output_dir))
+                
+                # master_p.start()
+                worker_p.start()
+                # master_p.join()
+                worker_p.join()
         else:
             train = trainers.pos_neg_hetero_trainer
             if cfg.distributed.backend == "gloo":
